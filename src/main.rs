@@ -537,6 +537,8 @@ async fn main() -> ExitCode {
                     Ok(_) => ExitCode::SUCCESS,
                     Err(_) => ExitCode::FAILURE,
                 },
+                // Stateless 2026-07-28 clients never send `initialize`; EOF before it is a clean close.
+                Err(rmcp::service::ServerInitializeError::ConnectionClosed(_)) => ExitCode::SUCCESS,
                 Err(_) => {
                     eprintln!("MCP transport failed");
                     ExitCode::FAILURE
