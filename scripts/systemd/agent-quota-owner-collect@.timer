@@ -1,0 +1,9 @@
+[Unit]
+Description=Periodically collect one agent-quota source (%i)
+
+[Timer]
+OnCalendar=*:0/5
+Unit=agent-quota-owner-collect@%i.service
+
+[Install]
+WantedBy=timers.target

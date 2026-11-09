@@ -1,0 +1,1231 @@
+//! PID reuse-aware process ownership. Unknown/denied evidence is never death.
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::io::Result;
+/// Kernel process identity; immutable start evidence fences reuse of a numeric PID.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct Identity {
+    /// Kernel process identifier, greater than one for owned processes.
+    pub(crate) pid: i32,
+    /// Parent identifier at observation time.
+    pub(crate) ppid: i32,
+    /// Process group at observation time.
+    pub(crate) group: i32,
+    /// Kernel start time in Unix seconds, used with the token to fence PID reuse.
+    pub(crate) birth: f64,
+    /// Immutable platform start token for this PID generation.
+    pub(crate) token: String,
+    /// Whether the observed process was already a zombie.
+    pub(crate) zombie: bool,
+}
+/// Classification of fresh kernel evidence against an owned process identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProcessState {
+    Alive,
+    Dead,
+    Reused,
+    Unknown,
+    Denied,
+    NotStarted,
+}
+/// Reads one Linux process identity from procfs without trusting command-name encoding.
+///
+/// `pid` must be greater than one. The function returns the underlying procfs,
+/// boot-clock, or numeric-field error when identity evidence is unavailable or
+/// malformed; callers decide whether that evidence permits lifecycle action.
+/// On success, `ppid` and `group` come from the stat fields, `birth` is Unix
+/// seconds derived from boot time plus start ticks, `token` is the stable
+/// `linux:<boot-id>:<start-ticks>` PID-reuse fence, and `zombie` covers both the
+/// kernel `Z` and dead-process `X` states.
+#[cfg(target_os = "linux")]
+pub(crate) fn inspect(pid: i32) -> std::io::Result<Identity> {
+    if pid <= 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "unsafe process id",
+        ));
+    }
+    // Read raw bytes: the parenthesized command name inherits the executable's
+    // filename bytes and is not guaranteed UTF-8 (psutil reads bytes for the
+    // same reason), so the line must never be validated as a String.
+    let stat = std::fs::read(format!("/proc/{pid}/stat"))?;
+    let parts = stat_fields(&stat)?;
+    let num = |i: usize| {
+        std::str::from_utf8(parts.get(i).ok_or_else(proc_field_error)?)
+            .map_err(|_| proc_field_error())?
+            .parse::<u64>()
+            .map_err(|_| proc_field_error())
+    };
+    let ticks = num(19)?;
+    let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+    let clock = std::fs::read_to_string("/proc/stat")?;
+    let epoch = clock
+        .lines()
+        .find_map(|s| s.strip_prefix("btime "))
+        .and_then(|s| s.parse::<f64>().ok())
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "boot time"))?;
+    // SAFETY: sysconf has no pointer arguments or side effects on process ownership.
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if hz <= 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(Identity {
+        pid,
+        ppid: num(1)? as i32,
+        group: num(2)? as i32,
+        birth: epoch + ticks as f64 / hz as f64,
+        token: format!("linux:{}:{ticks}", boot.trim()),
+        zombie: parts
+            .first()
+            .is_some_and(|state| *state == b"Z" || *state == b"X"),
+    })
+}
+/// Split one `/proc/<pid>/stat` line into the fields after the command name.
+///
+/// The line is arbitrary bytes: the kernel copies the executable's filename
+/// into the parenthesized command name verbatim, so it may contain invalid
+/// UTF-8 or unbalanced parentheses. Fields are therefore taken after the final
+/// `)`, which cannot appear in the numeric tail. Returns the whitespace-split
+/// tail fields, or `InvalidData` when the line has no command name at all.
+#[cfg(any(target_os = "linux", test))]
+fn stat_fields(stat: &[u8]) -> std::io::Result<Vec<&[u8]>> {
+    let end = stat
+        .iter()
+        .rposition(|&byte| byte == b')')
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "proc stat"))?;
+    Ok(stat[end + 1..]
+        .split(|&byte| byte.is_ascii_whitespace())
+        .filter(|field| !field.is_empty())
+        .collect())
+}
+/// Report one unparsable `/proc/<pid>/stat` tail field.
+#[cfg(target_os = "linux")]
+fn proc_field_error() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, "proc field")
+}
+/// Read one PID's kernel start time, group and zombie state.
+///
+/// `birth` is the kernel `p_start` timeval computed exactly like psutil's
+/// `tv_sec + tv_usec / 1000000.0`, so it equals Python's stored create_time
+/// bit for bit (see `docs/process-identity.md`).
+#[cfg(target_os = "macos")]
+pub(crate) fn inspect(pid: i32) -> std::io::Result<Identity> {
+    if pid <= 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "unsafe process id",
+        ));
+    }
+    // SAFETY: proc_bsdinfo is plain old data, so the all-zero value is valid.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: the buffer is a writable proc_bsdinfo of exactly `size` bytes, as
+    // PROC_PIDTBSDINFO requires.
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    if n != size {
+        let error = std::io::Error::last_os_error();
+        // proc_pidinfo is same-user only; psutil reads every process through
+        // sysctl. Without this fallback a PID reused by another user's process
+        // would read as denied instead of reused.
+        if !matches!(error.raw_os_error(), Some(libc::EPERM) | Some(libc::EACCES)) {
+            return Err(error);
+        }
+        let (seconds, micros) = sysctl_start_time(pid).map_err(|_| error)?;
+        // Only the start time is readable this way: relationship fields stay 0
+        // (unknown), which keeps every ownership and signal check fail-closed.
+        return Ok(Identity {
+            pid,
+            ppid: 0,
+            group: 0,
+            birth: seconds as f64 + micros as f64 / 1_000_000.,
+            token: format!("darwin:{seconds}:{micros}"),
+            zombie: false,
+        });
+    }
+    Ok(Identity {
+        pid,
+        ppid: info.pbi_ppid as i32,
+        group: info.pbi_pgid as i32,
+        birth: info.pbi_start_tvsec as f64 + info.pbi_start_tvusec as f64 / 1_000_000.,
+        token: format!("darwin:{}:{}", info.pbi_start_tvsec, info.pbi_start_tvusec),
+        zombie: info.pbi_status == 5, // SZOMB
+    })
+}
+/// Read one PID's start time from `KERN_PROC_PID`, exactly psutil's source.
+///
+/// `kinfo_proc` begins with `struct extern_proc`, whose first member is the
+/// `p_starttime` timeval psutil converts; only that prefix is read here.
+#[cfg(target_os = "macos")]
+fn sysctl_start_time(pid: i32) -> std::io::Result<(u64, u64)> {
+    /// Native timeval prefix of Darwin extern_proc.
+    #[repr(C)]
+    struct StartTime {
+        seconds: i64,
+        micros: i32,
+        padding: i32,
+    }
+    let mut name = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid];
+    let mut length: libc::size_t = 0;
+    // SAFETY: `name` is a four-element MIB and `length` a valid out-parameter;
+    // a null buffer only asks for the record size.
+    let sized = unsafe {
+        libc::sysctl(
+            name.as_mut_ptr(),
+            4,
+            std::ptr::null_mut(),
+            &mut length,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if sized != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if length < std::mem::size_of::<StartTime>() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no kinfo_proc record",
+        ));
+    }
+    let mut record = vec![0u8; length];
+    // SAFETY: the buffer is writable for exactly `length` bytes, as reported above.
+    let read = unsafe {
+        libc::sysctl(
+            name.as_mut_ptr(),
+            4,
+            record.as_mut_ptr().cast(),
+            &mut length,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if read != 0 || length < std::mem::size_of::<StartTime>() {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: the checked payload contains a fully initialized StartTime prefix;
+    // read_unaligned does not require alignment from the byte allocation.
+    let start = unsafe { record.as_ptr().cast::<StartTime>().read_unaligned() };
+    let _ = start.padding;
+    Ok((start.seconds as u64, start.micros as u64))
+}
+/// Compare a PID with stored evidence; unreadable evidence is never death.
+///
+/// Rust-written `linux:`/`darwin:` tokens compare exactly. Python-written rows
+/// carry only psutil's float create_time, compared with `==` as Python does.
+pub(crate) fn observe(pid: Option<i32>, token: Option<&str>, birth: Option<f64>) -> ProcessState {
+    let Some(pid) = pid else {
+        return ProcessState::NotStarted;
+    };
+    verdict(inspect(pid), token, birth)
+}
+/// Classify one inspection result against stored token/birth evidence.
+fn verdict(
+    observed: std::io::Result<Identity>,
+    token: Option<&str>,
+    birth: Option<f64>,
+) -> ProcessState {
+    match observed {
+        Ok(actual) => {
+            let matches = if let Some(token) =
+                token.filter(|s| s.starts_with("linux:") || s.starts_with("darwin:"))
+            {
+                actual.token == token
+            } else if let Some(birth) = birth {
+                actual.birth == birth
+            } else {
+                return ProcessState::Unknown;
+            };
+            if !matches {
+                ProcessState::Reused
+            } else if actual.zombie {
+                ProcessState::Dead
+            } else {
+                ProcessState::Alive
+            }
+        }
+        Err(e) => match e.raw_os_error() {
+            Some(libc::ENOENT) | Some(libc::ESRCH) => ProcessState::Dead,
+            Some(libc::EPERM) | Some(libc::EACCES) => ProcessState::Denied,
+            _ => ProcessState::Unknown,
+        },
+    }
+}
+
+/// Return whether an exact PID observation proves the captured process exited.
+fn identity_gone(state: ProcessState) -> bool {
+    state == ProcessState::Dead
+}
+
+/// Return whether an exact PID observation permits an ownership signal.
+fn signal_allowed(state: ProcessState) -> bool {
+    state == ProcessState::Alive
+}
+
+/// Native observation of the original owned process group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GroupObservation {
+    /// The original group has no remaining members.
+    Gone,
+    /// The original group still has a member.
+    Alive,
+    /// The leader or group could not be observed safely.
+    Unknown,
+}
+/// Enumerate every process whose identity can be observed without spawning a child.
+///
+/// Linux obtains candidate PIDs directly from `/proc`; macOS asks the kernel for
+/// `KERN_PROC_ALL` records. A process which exits during this snapshot is omitted,
+/// but any other unreadable identity aborts the snapshot so cleanup cannot mistake
+/// an unknown group member for a dead one.
+pub(crate) fn processes() -> Result<Vec<Identity>> {
+    #[cfg(target_os = "linux")]
+    let ids = proc_ids()?;
+    #[cfg(target_os = "macos")]
+    let ids = sysctl_process_ids()?;
+
+    let mut observed = Vec::with_capacity(ids.len());
+    for pid in ids {
+        match inspect(pid) {
+            Ok(identity) => observed.push(identity),
+            Err(error)
+                if matches!(error.raw_os_error(), Some(libc::ENOENT) | Some(libc::ESRCH)) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(observed)
+}
+
+/// List numeric process directory names from Linux's native procfs.
+#[cfg(target_os = "linux")]
+fn proc_ids() -> std::io::Result<Vec<i32>> {
+    let mut ids = Vec::new();
+    for entry in std::fs::read_dir("/proc")? {
+        let entry = entry?;
+        if let Some(pid) = safe_process_id(&entry.file_name()) {
+            ids.push(pid);
+        }
+    }
+    Ok(ids)
+}
+
+/// Parse one process-directory name only when it is safe to inspect or signal.
+///
+/// PID 0 and PID 1 are excluded before [`processes`] calls [`inspect`], so the
+/// platform-wide snapshot cannot fail merely because procfs exposes its init
+/// process alongside owned runtime processes.
+#[cfg(any(target_os = "linux", test))]
+fn safe_process_id(name: &std::ffi::OsStr) -> Option<i32> {
+    name.to_str()?.parse().ok().filter(|pid| *pid > 1)
+}
+
+/// Prefix of Darwin's `struct extern_proc` ending at its stable PID field.
+///
+/// `KERN_PROC_ALL` returns full `kinfo_proc` records. Their total size is
+/// runtime-discovered below because Apple can extend the trailing fields; this
+/// fixed ABI prefix is sufficient to read `extern_proc.p_pid` from each record.
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct KernProcPrefix {
+    /// `extern_proc.p_un`, either two links or one `timeval`.
+    _links_or_start: [usize; 2],
+    /// `extern_proc.p_vmspace`.
+    _vmspace: *mut libc::c_void,
+    /// `extern_proc.p_sigacts`.
+    _sigacts: *mut libc::c_void,
+    /// `extern_proc.p_flag`.
+    _flags: libc::c_int,
+    /// `extern_proc.p_stat`.
+    _status: libc::c_char,
+    /// C ABI padding before the following `pid_t`.
+    _padding: [u8; 3],
+    /// `extern_proc.p_pid`, the process identifier in this record.
+    pid: libc::pid_t,
+}
+
+/// Read a Darwin sysctl payload, retrying once if process creation grew it.
+#[cfg(target_os = "macos")]
+fn sysctl_bytes(name: &mut [libc::c_int]) -> std::io::Result<Vec<u8>> {
+    for _ in 0..2 {
+        let mut length: libc::size_t = 0;
+        // SAFETY: `name` is a valid mutable MIB, `length` is a valid out-pointer,
+        // and a null output buffer requests the exact payload size without writing.
+        if unsafe {
+            libc::sysctl(
+                name.as_mut_ptr(),
+                name.len() as libc::c_uint,
+                std::ptr::null_mut(),
+                &mut length,
+                std::ptr::null_mut(),
+                0,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut bytes = vec![0u8; length.saturating_add(4096)];
+        let mut capacity = bytes.len();
+        // SAFETY: `bytes` owns a writable buffer of exactly `capacity` bytes;
+        // `capacity` is passed to the kernel and returned with the initialized
+        // payload length, while `name` remains a valid MIB for this call.
+        if unsafe {
+            libc::sysctl(
+                name.as_mut_ptr(),
+                name.len() as libc::c_uint,
+                bytes.as_mut_ptr().cast(),
+                &mut capacity,
+                std::ptr::null_mut(),
+                0,
+            )
+        } == 0
+        {
+            bytes.truncate(capacity);
+            return Ok(bytes);
+        }
+        if std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOMEM) {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Err(std::io::Error::from_raw_os_error(libc::ENOMEM))
+}
+
+/// List PIDs from Darwin's `KERN_PROC_ALL` records without invoking `ps`.
+#[cfg(target_os = "macos")]
+fn sysctl_process_ids() -> std::io::Result<Vec<i32>> {
+    match sysctl_process_ids_inner() {
+        Ok(ids) => Ok(ids),
+        Err(error) if matches!(error.raw_os_error(), Some(libc::EPERM) | Some(libc::EACCES)) => {
+            proc_list_all_pids()
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Read Darwin `KERN_PROC_ALL` records and extract their stable PID prefix.
+#[cfg(target_os = "macos")]
+fn sysctl_process_ids_inner() -> std::io::Result<Vec<i32>> {
+    let mut one = [
+        libc::CTL_KERN,
+        libc::KERN_PROC,
+        libc::KERN_PROC_PID,
+        std::process::id() as i32,
+    ];
+    let record_size = sysctl_bytes(&mut one)?.len();
+    if record_size < std::mem::size_of::<KernProcPrefix>() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "short kinfo_proc record",
+        ));
+    }
+    let mut all = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_ALL];
+    let records = sysctl_bytes(&mut all)?;
+    if records.len() % record_size != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "partial kinfo_proc record",
+        ));
+    }
+    const PID_OFFSET: usize = std::mem::offset_of!(KernProcPrefix, pid);
+    Ok(records
+        .chunks_exact(record_size)
+        .filter_map(|record| {
+            let bytes: [u8; std::mem::size_of::<libc::pid_t>()] = record
+                .get(PID_OFFSET..PID_OFFSET + std::mem::size_of::<libc::pid_t>())?
+                .try_into()
+                .ok()?;
+            let pid = libc::pid_t::from_ne_bytes(bytes);
+            (pid > 1).then_some(pid)
+        })
+        .collect())
+}
+
+/// List Darwin PIDs through libproc when a sandbox denies the sysctl snapshot.
+#[cfg(target_os = "macos")]
+fn proc_list_all_pids() -> std::io::Result<Vec<i32>> {
+    // libproc.c returns a PID count, while its buffer length is in bytes:
+    // https://github.com/apple-oss-distributions/xnu/blob/main/libsyscall/wrappers/libproc/libproc.c
+    for _ in 0..2 {
+        // SAFETY: a null buffer and zero size only query the required PID count.
+        let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+        if count <= 0 {
+            return Err(std::io::Error::other("process enumeration unavailable"));
+        }
+        let capacity = (count as usize)
+            .checked_add(1024)
+            .ok_or_else(|| std::io::Error::other("process enumeration overflow"))?;
+        let bytes = capacity
+            .checked_mul(std::mem::size_of::<libc::pid_t>())
+            .and_then(|bytes| libc::c_int::try_from(bytes).ok())
+            .ok_or_else(|| std::io::Error::other("process enumeration overflow"))?;
+        let mut ids = vec![0i32; capacity];
+        // SAFETY: ids provides aligned, initialized PID storage for exactly bytes
+        // writable bytes. The result counts populated PIDs, not bytes.
+        let read = unsafe { libc::proc_listallpids(ids.as_mut_ptr().cast(), bytes) };
+        if read <= 0 {
+            return Err(std::io::Error::other("process enumeration unavailable"));
+        }
+        if read as usize >= capacity {
+            continue;
+        }
+        ids.truncate(read as usize);
+        ids.retain(|pid| *pid > 1);
+        return Ok(ids);
+    }
+    Err(std::io::Error::other(
+        "process enumeration changed during snapshot",
+    ))
+}
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+/// Process-group and descendant cleanup evidence for one owned runtime.
+pub(crate) struct Cleanup {
+    /// Signal names successfully delivered to the verified group or captured descendants.
+    pub(crate) signals: Vec<String>,
+    /// Scope of the descendant evidence.
+    ///
+    /// `verified_descendants` when a descendant verdict exists, otherwise
+    /// `process_group`: the group alone was observed and the descendant closure
+    /// was never verified.
+    pub(crate) scope: String,
+    /// Whether native group observation proved the original group absent.
+    pub(crate) group_gone: bool,
+    /// Whether every captured descendant identity is gone. `Some(false)`
+    /// includes live or unreadable identities; `None` means no verified snapshot.
+    ///
+    /// Neither `Some(false)` nor `None` confirms cleanup.
+    pub(crate) descendants_gone: Option<bool>,
+    /// Whether both group and descendant observations confirm cleanup.
+    pub(crate) confirmed: bool,
+    /// Original process-group identifier, when safe to report.
+    pub(crate) process_group_id: Option<i32>,
+}
+/// PID-reuse-aware ownership evidence for one child process group.
+pub(crate) struct OwnedProcess {
+    /// Captured identity of the group leader, when readable at spawn time.
+    pub(crate) leader: Option<Identity>,
+    /// Expected process-group identifier, equal to the spawned leader PID.
+    pub(crate) pid: i32,
+    /// Captured leader and descendants indexed by PID and immutable start token.
+    known: BTreeMap<(i32, String), Identity>,
+    /// Whether tracking began from a live verified leader or a later live snapshot.
+    ///
+    /// False means no descendant set was ever verified, so cleanup reports the
+    /// descendant scope as unknown rather than clean.
+    descendants_observed: bool,
+}
+impl OwnedProcess {
+    /// Capture the spawned leader identity without assuming failure is death.
+    ///
+    /// A live identity establishes the root from which periodic snapshots expand.
+    /// The child may already have forked: this observation does not prove an empty
+    /// historical tree. Cleanup confirms only the original group and identities
+    /// actually captured, never unobserved descendants which escaped beforehand.
+    /// An already absent, zombie or unreadable leader cannot establish this root,
+    /// so descendant cleanup stays unknown unless a later live snapshot succeeds.
+    pub(crate) fn capture(pid: i32) -> Self {
+        let leader = inspect(pid).ok();
+        let known: BTreeMap<_, _> = leader
+            .clone()
+            .into_iter()
+            .map(|p| ((p.pid, p.token.clone()), p))
+            .collect();
+        let descendants_observed = leader.as_ref().is_some_and(|p| !p.zombie);
+        Self {
+            leader,
+            pid,
+            known,
+            descendants_observed,
+        }
+    }
+    /// Record descendants visible from a complete native process snapshot.
+    ///
+    /// Captured identities accumulate in `known` and survive later refreshes, so
+    /// a descendant seen while the leader lived is still probed individually by
+    /// `cleanup`. On Linux, new group members are captured only while the
+    /// recorded leader is alive; its number may name an unrelated later group.
+    /// The snapshot counts as *verified* descendant evidence only when
+    /// the captured leader is itself observably alive: after it exits, a
+    /// descendant which left the original process group is reachable through
+    /// neither parentage nor the group, so an empty snapshot then proves nothing.
+    /// A failed `processes()` call records nothing and
+    /// leaves the existing evidence untouched.
+    pub(crate) fn refresh(&mut self) {
+        let Ok(all) = processes() else {
+            return;
+        };
+        let leader_state = self
+            .leader
+            .as_ref()
+            .map(|p| observe(Some(p.pid), Some(&p.token), Some(p.birth)));
+        if leader_state == Some(ProcessState::Alive) {
+            self.descendants_observed = true;
+        }
+        #[cfg(target_os = "linux")]
+        let leader_owned = leader_state == Some(ProcessState::Alive);
+        #[cfg(not(target_os = "linux"))]
+        let leader_owned = matches!(leader_state, Some(ProcessState::Alive | ProcessState::Dead));
+        // Expand only from currently verified owned parents, never an unverified reused PID.
+        loop {
+            let mut changed = false;
+            for p in &all {
+                let child = self
+                    .known
+                    .range((p.ppid, String::new())..)
+                    .take_while(|((pid, _), _)| *pid == p.ppid)
+                    .any(|(_, parent)| {
+                        observe(Some(parent.pid), Some(&parent.token), Some(parent.birth))
+                            == ProcessState::Alive
+                    });
+                let in_group = leader_owned && p.group == self.pid;
+                if (child || in_group) && !self.known.contains_key(&(p.pid, p.token.clone())) {
+                    let key = (p.pid, p.token.clone());
+                    self.known.insert(key, p.clone());
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+    /// Signal only a currently verified owned process group.
+    pub(crate) fn signal(&mut self, sig: i32) -> Result<bool> {
+        self.refresh();
+        let mut signalled = false;
+        if let Some(p) = &self.leader
+            && p.group == self.pid
+            && signal_allowed(observe(Some(p.pid), Some(&p.token), Some(p.birth)))
+        {
+            // SAFETY: signal only the verified child-created process group; never group 0/1.
+            let code = unsafe { libc::kill(-self.pid, sig) };
+            if code == 0 {
+                signalled = true;
+            } else if std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        Ok(signalled)
+    }
+    /// Observe a captured descendant by its exact PID, native token and birth time.
+    /// Missing evidence stays unknown; a matching zombie is dead, not signallable.
+    fn descendant_state(process: &Identity) -> ProcessState {
+        if process.pid <= 1 || process.token.is_empty() || !process.birth.is_finite() {
+            return ProcessState::Unknown;
+        }
+        match inspect(process.pid) {
+            Ok(actual) if actual.pid != process.pid => ProcessState::Unknown,
+            Ok(actual) if actual.token != process.token || actual.birth != process.birth => {
+                ProcessState::Reused
+            }
+            Ok(actual) if actual.zombie => ProcessState::Dead,
+            Ok(_) => ProcessState::Alive,
+            Err(error) => verdict(Err(error), Some(&process.token), Some(process.birth)),
+        }
+    }
+    /// Signal each still-live captured descendant after a fresh exact identity check.
+    /// A vanished, reused, unreadable or incomplete identity is never signalled.
+    /// Failed signals do not skip later descendants; evidence remains unconfirmed if they live.
+    pub(crate) fn signal_descendants(&mut self, sig: i32) -> bool {
+        self.refresh();
+        let mut signalled = false;
+        for process in self.known.values().filter(|process| {
+            self.leader
+                .as_ref()
+                .map_or(process.pid != self.pid, |leader| {
+                    process.pid != leader.pid || process.token != leader.token
+                })
+        }) {
+            if Self::descendant_state(process) != ProcessState::Alive {
+                continue;
+            }
+            // SAFETY: the positive PID was just inspected against its captured token and birth.
+            if unsafe { libc::kill(process.pid, sig) } == 0 {
+                signalled = true;
+            }
+        }
+        signalled
+    }
+    /// Report whether all captured descendants are gone, or unknown without a verified snapshot.
+    fn descendants_gone(&self) -> Option<bool> {
+        self.descendants_observed.then(|| {
+            let mut unknown = false;
+            for process in self.known.values().filter(|process| {
+                self.leader
+                    .as_ref()
+                    .map_or(process.pid != self.pid, |leader| {
+                        process.pid != leader.pid || process.token != leader.token
+                    })
+            }) {
+                match Self::descendant_state(process) {
+                    ProcessState::Dead | ProcessState::Reused => {}
+                    ProcessState::Alive => return false,
+                    ProcessState::Unknown | ProcessState::Denied | ProcessState::NotStarted => {
+                        unknown = true;
+                    }
+                }
+            }
+            !unknown
+        })
+    }
+    /// Refresh parentage and check whether group and descendant evidence can settle.
+    /// An absent descendant snapshot cannot confirm cleanup but needs no extra wait.
+    fn settled(&mut self) -> bool {
+        self.refresh();
+        self.gone() && self.descendants_gone() != Some(false)
+    }
+    /// Return whether the leader and its original group are both proven absent.
+    pub(crate) fn gone(&self) -> bool {
+        self.group_observation() == GroupObservation::Gone
+    }
+    /// Observe the captured leader and its original group without sending a signal.
+    fn group_observation(&self) -> GroupObservation {
+        match &self.leader {
+            Some(p) => {
+                let state = observe(Some(p.pid), Some(&p.token), Some(p.birth));
+                if signal_allowed(state) {
+                    return GroupObservation::Alive;
+                }
+                if !identity_gone(state) && state != ProcessState::Reused {
+                    return GroupObservation::Unknown;
+                }
+            }
+            None => match inspect(self.pid) {
+                Err(error)
+                    if matches!(error.raw_os_error(), Some(libc::ENOENT) | Some(libc::ESRCH)) => {}
+                Err(_) => return GroupObservation::Unknown,
+                Ok(identity) if identity.zombie => {}
+                Ok(_) => return GroupObservation::Unknown,
+            },
+        }
+        if self.pid <= 1 {
+            return GroupObservation::Unknown;
+        }
+        if let Ok(processes) = processes() {
+            return if processes
+                .iter()
+                .any(|process| process.group == self.pid && !process.zombie)
+            {
+                GroupObservation::Alive
+            } else {
+                GroupObservation::Gone
+            };
+        }
+        // SAFETY: signal 0 observes only the explicitly captured process group;
+        // `pid > 1` prevents the wildcard and this supervisor's own group.
+        match unsafe { libc::kill(-self.pid, 0) } {
+            // Without the native snapshot, signal 0 cannot distinguish a live
+            // member from an unreaped zombie, so it is not completion evidence.
+            0 => GroupObservation::Unknown,
+            _ => match std::io::Error::last_os_error().raw_os_error() {
+                Some(libc::ESRCH) => GroupObservation::Gone,
+                // POSIX signal 0 with EPERM proves the group exists but does
+                // not grant permission to signal it, matching Python's group_alive.
+                Some(libc::EPERM) | Some(libc::EACCES) => GroupObservation::Alive,
+                _ => GroupObservation::Unknown,
+            },
+        }
+    }
+    /// Blocking twin of [`Self::cleanup`] for synchronous recovery paths.
+    /// Group signals keep their leader guard; each surviving captured descendant
+    /// is independently verified before TERM and, after a bounded wait, KILL.
+    pub(crate) fn cleanup_blocking(&mut self, grace: std::time::Duration) -> Result<Cleanup> {
+        let mut signals = Vec::new();
+        self.refresh();
+        if !self.gone() && self.signal(libc::SIGTERM).unwrap_or(false) {
+            signals.push("SIGTERM".into());
+        }
+        if self.signal_descendants(libc::SIGTERM)
+            && !signals.iter().any(|signal| signal == "SIGTERM")
+        {
+            signals.push("SIGTERM".into());
+        }
+        let until = std::time::Instant::now() + grace;
+        while std::time::Instant::now() < until && !self.settled() {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        if !self.gone() && self.signal(libc::SIGKILL).unwrap_or(false) {
+            signals.push("SIGKILL".into());
+        }
+        if self.signal_descendants(libc::SIGKILL)
+            && !signals.iter().any(|signal| signal == "SIGKILL")
+        {
+            signals.push("SIGKILL".into());
+        }
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < until && !self.settled() {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let settle_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let result = self.evidence(signals.clone());
+            if result
+                .as_ref()
+                .is_ok_and(|proof| proof.confirmed || proof.descendants_gone.is_none())
+                || std::time::Instant::now() >= settle_deadline
+            {
+                return result;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+    /// Terminate the verified group and separately signal captured live descendants.
+    /// TERM and KILL use fresh identity checks, bounded waits, and final evidence settling.
+    pub(crate) async fn cleanup(&mut self, grace: std::time::Duration) -> Result<Cleanup> {
+        let mut signals = Vec::new();
+        self.refresh();
+        if !self.gone() && self.signal(libc::SIGTERM).unwrap_or(false) {
+            signals.push("SIGTERM".into());
+        }
+        if self.signal_descendants(libc::SIGTERM)
+            && !signals.iter().any(|signal| signal == "SIGTERM")
+        {
+            signals.push("SIGTERM".into());
+        }
+        let until = tokio::time::Instant::now() + grace;
+        while tokio::time::Instant::now() < until && !self.settled() {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        if !self.gone() && self.signal(libc::SIGKILL).unwrap_or(false) {
+            signals.push("SIGKILL".into());
+        }
+        if self.signal_descendants(libc::SIGKILL)
+            && !signals.iter().any(|signal| signal == "SIGKILL")
+        {
+            signals.push("SIGKILL".into());
+        }
+        let until = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while tokio::time::Instant::now() < until && !self.settled() {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let settle_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let result = self.evidence(signals.clone());
+            if result
+                .as_ref()
+                .is_ok_and(|proof| proof.confirmed || proof.descendants_gone.is_none())
+                || tokio::time::Instant::now() >= settle_deadline
+            {
+                return result;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+    /// Final group and exact descendant observation after `signals` were sent.
+    /// An unknown group returns an error instead of confirmed cleanup evidence.
+    fn evidence(&self, signals: Vec<String>) -> Result<Cleanup> {
+        let group = self.group_observation();
+        if group == GroupObservation::Unknown {
+            return Err(std::io::Error::other(
+                "process cleanup observation unavailable",
+            ));
+        }
+        let group_gone = group == GroupObservation::Gone;
+        let descendants_gone = self.descendants_gone();
+        Ok(Cleanup {
+            signals,
+            // the wider scope is claimed only when a descendant verdict exists.
+            scope: if descendants_gone.is_some() {
+                "verified_descendants"
+            } else {
+                "process_group"
+            }
+            .into(),
+            group_gone,
+            descendants_gone,
+            confirmed: group_gone && descendants_gone == Some(true),
+            process_group_id: Some(self.pid),
+        })
+    }
+}
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::print_stdout)]
+mod tests {
+    use super::*;
+
+    /// Reaps immediate fixture children on both success and assertion unwinding.
+    struct TestChild(std::process::Child);
+
+    impl std::ops::Deref for TestChild {
+        type Target = std::process::Child;
+
+        /// Borrows the owned fixture child.
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl std::ops::DerefMut for TestChild {
+        /// Mutably borrows the child without transferring its cleanup obligation.
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.0
+        }
+    }
+
+    impl Drop for TestChild {
+        /// Stops and reaps only this test-owned immediate child, even after failure.
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// Procfs init and wildcard-like names never enter a process snapshot.
+    #[test]
+    fn process_directory_names_require_a_pid_above_one() {
+        assert_eq!(safe_process_id(std::ffi::OsStr::new("0")), None);
+        assert_eq!(safe_process_id(std::ffi::OsStr::new("1")), None);
+        assert_eq!(safe_process_id(std::ffi::OsStr::new("self")), None);
+        assert_eq!(safe_process_id(std::ffi::OsStr::new("2")), Some(2));
+    }
+
+    /// A stat line whose command name carries non-UTF-8 filename bytes still
+    /// yields the numeric identity fields; reading it as a String would reject
+    /// the whole observation as unreadable and lose the leader identity.
+    #[test]
+    fn stat_fields_tolerate_non_utf8_command_names() {
+        let line =
+            b"1234 (sh\xee) R 1200 1234 1234 0 -1 4194304 200 0 0 0 1 2 3 4 20 0 6 0 98765 0";
+        let fields = stat_fields(line).expect("non-UTF-8 command name");
+        assert_eq!(fields.first(), Some(&b"R".as_slice()));
+        assert_eq!(fields.get(1), Some(&b"1200".as_slice()));
+        assert_eq!(fields.get(2), Some(&b"1234".as_slice()));
+        assert_eq!(fields.get(19), Some(&b"98765".as_slice()));
+        assert!(stat_fields(b"no command name").is_err());
+    }
+
+    #[test]
+    fn unreadable_evidence_is_never_death() {
+        let failed = |code| Err(std::io::Error::from_raw_os_error(code));
+        assert_eq!(
+            verdict(failed(libc::EPERM), None, Some(1.0)),
+            ProcessState::Denied
+        );
+        assert_eq!(
+            verdict(failed(libc::EACCES), None, Some(1.0)),
+            ProcessState::Denied
+        );
+        assert_eq!(
+            verdict(failed(libc::EIO), None, Some(1.0)),
+            ProcessState::Unknown
+        );
+        assert_eq!(
+            verdict(failed(libc::ESRCH), None, Some(1.0)),
+            ProcessState::Dead
+        );
+        assert_eq!(
+            verdict(failed(libc::ENOENT), None, Some(1.0)),
+            ProcessState::Dead
+        );
+    }
+
+    #[test]
+    fn unknown_or_denied_identity_is_never_gone_or_signallable() {
+        for state in [ProcessState::Unknown, ProcessState::Denied] {
+            assert!(!identity_gone(state));
+            assert!(!signal_allowed(state));
+        }
+    }
+
+    /// A readable process table is not descendant evidence once the leader is
+    /// gone: a descendant which left the original group is then reachable
+    /// through neither parentage nor the group, so the empty result must report
+    /// unknown rather than a clean, confirmed teardown.
+    #[tokio::test]
+    async fn an_unverified_descendant_snapshot_is_unknown_not_clean() {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .map(TestChild)
+            .expect("spawn owned test child");
+        let pid = child.id() as i32;
+        let mut owned = OwnedProcess::capture(pid);
+        assert!(
+            owned.descendants_observed,
+            "a snapshot taken while the leader lives is verified evidence"
+        );
+        child.kill().expect("stop owned test child");
+        child.wait().expect("reap owned test child");
+        // Model an owner whose leader died before any snapshot succeeded: the
+        // process table is still readable, and that alone must not verify.
+        owned.descendants_observed = false;
+        owned.refresh();
+        assert!(
+            !owned.descendants_observed,
+            "a post-exit snapshot must never count as verification"
+        );
+        let cleanup = owned
+            .cleanup(std::time::Duration::from_millis(50))
+            .await
+            .expect("cleanup observation available");
+        assert_eq!(cleanup.descendants_gone, None);
+        assert_eq!(cleanup.scope, "process_group");
+        assert!(!cleanup.confirmed);
+        assert!(cleanup.signals.is_empty());
+    }
+
+    /// A surviving captured helper receives TERM immediately, without passive exit grace.
+    #[tokio::test]
+    async fn cleanup_signals_captured_descendant_after_group_exit() {
+        use std::os::unix::process::CommandExt;
+
+        let mut helper = std::process::Command::new("/bin/sleep")
+            .arg("0.5")
+            .spawn()
+            .map(TestChild)
+            .expect("spawn helper");
+        let mut leader = std::process::Command::new("/bin/sleep")
+            .arg("0.05")
+            .process_group(0)
+            .spawn()
+            .map(TestChild)
+            .expect("spawn owned leader");
+        let mut owned = OwnedProcess::capture(leader.id() as i32);
+        let helper_identity = inspect(helper.id() as i32).expect("inspect helper");
+        assert_ne!(helper_identity.group, owned.pid);
+        owned.known.insert(
+            (helper_identity.pid, helper_identity.token.clone()),
+            helper_identity,
+        );
+        leader.wait().expect("reap leader");
+
+        let cleanup = owned
+            .cleanup(std::time::Duration::from_millis(750))
+            .await
+            .expect("cleanup observation available");
+        helper.wait().expect("reap helper");
+        assert!(cleanup.confirmed);
+        assert_eq!(cleanup.descendants_gone, Some(true));
+        assert_eq!(cleanup.signals, ["SIGTERM"]);
+    }
+
+    /// Spawn a helper in its own group while this test process is the owned leader.
+    /// The leader deliberately exits first; the outer regression owns helper cleanup.
+    #[test]
+    #[allow(clippy::zombie_processes)]
+    fn detached_helper_fixture() {
+        use std::io::Write;
+        use std::os::unix::process::CommandExt;
+
+        if std::env::var_os("AGENT_QUOTA_DETACHED_HELPER_FIXTURE").is_none() {
+            return;
+        }
+        let helper = std::process::Command::new("/bin/sleep")
+            .arg("10")
+            .process_group(0)
+            .spawn()
+            .expect("spawn detached helper");
+        println!("DETACHED_HELPER_PID={}", helper.id());
+        std::io::stdout().flush().expect("flush helper PID");
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+
+    /// Cleanup captures a real child by verified parentage, then signals it
+    /// after the leader exits even though the child changed process groups.
+    #[tokio::test]
+    async fn cleanup_terminates_captured_helper_outside_original_group() {
+        use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
+
+        let mut leader = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .arg("--exact")
+            .arg("process::tests::detached_helper_fixture")
+            .arg("--nocapture")
+            .env("AGENT_QUOTA_DETACHED_HELPER_FIXTURE", "1")
+            .process_group(0)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .map(TestChild)
+            .expect("spawn owned leader");
+        let mut owned = OwnedProcess::capture(leader.id() as i32);
+        let mut output = std::io::BufReader::new(leader.stdout.take().expect("fixture output"));
+        let helper_pid = (&mut output)
+            .lines()
+            .find_map(|line| {
+                line.ok()?
+                    .split("DETACHED_HELPER_PID=")
+                    .nth(1)?
+                    .trim()
+                    .parse::<i32>()
+                    .ok()
+            })
+            .expect("fixture helper PID");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while !owned.known.values().any(|member| member.pid == helper_pid)
+            && std::time::Instant::now() < deadline
+        {
+            owned.refresh();
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let helper_identity = owned
+            .known
+            .values()
+            .find(|member| member.pid == helper_pid)
+            .expect("captured child identity");
+        assert_ne!(helper_identity.group, owned.pid);
+        leader.wait().expect("reap leader");
+        drop(output);
+
+        let cleanup = owned
+            .cleanup(std::time::Duration::from_millis(50))
+            .await
+            .expect("cleanup observation available");
+        assert!(cleanup.group_gone);
+        assert_eq!(cleanup.descendants_gone, Some(true));
+        assert!(cleanup.confirmed);
+        assert_eq!(cleanup.signals, ["SIGTERM"]);
+    }
+
+    /// Blocking cleanup escalates to KILL for an exact detached identity that
+    /// ignores TERM, and confirms its exit independently of the original group.
+    #[test]
+    fn blocking_cleanup_kills_detached_helper_after_grace() {
+        use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
+
+        let mut helper = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("trap '' TERM; echo ready; exec /bin/sleep 30")
+            .process_group(0)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .map(TestChild)
+            .expect("spawn TERM-resistant helper");
+        let mut ready = String::new();
+        std::io::BufReader::new(helper.stdout.take().expect("helper output"))
+            .read_line(&mut ready)
+            .expect("read helper readiness");
+        assert_eq!(ready.trim(), "ready");
+        let mut leader = std::process::Command::new("/bin/sleep")
+            .arg("0.05")
+            .process_group(0)
+            .spawn()
+            .map(TestChild)
+            .expect("spawn owned leader");
+        let mut owned = OwnedProcess::capture(leader.id() as i32);
+        let identity = inspect(helper.id() as i32).expect("inspect helper");
+        assert_ne!(identity.group, owned.pid);
+        owned
+            .known
+            .insert((identity.pid, identity.token.clone()), identity);
+        leader.wait().expect("reap leader");
+
+        let cleanup = owned
+            .cleanup_blocking(std::time::Duration::from_millis(50))
+            .expect("cleanup observation available");
+        if !cleanup.confirmed {
+            helper.kill().expect("stop surviving helper");
+        }
+        helper.wait().expect("reap helper");
+        assert!(cleanup.confirmed);
+        assert_eq!(cleanup.signals, ["SIGTERM", "SIGKILL"]);
+    }
+
+    /// Reused or incomplete descendant identities never authorize a PID signal;
+    /// an incomplete live identity also cannot become positive cleanup evidence.
+    #[test]
+    fn reused_or_unknown_descendant_identity_is_not_signalled() {
+        use std::os::unix::process::CommandExt;
+
+        let mut helper = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .map(TestChild)
+            .expect("spawn unrelated helper");
+        let mut leader = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .map(TestChild)
+            .expect("spawn owned leader");
+        let mut owned = OwnedProcess::capture(leader.id() as i32);
+        let mut identity = inspect(helper.id() as i32).expect("inspect helper");
+        let captured = identity.clone();
+        identity.token.push_str(":reused");
+        assert_eq!(
+            OwnedProcess::descendant_state(&identity),
+            ProcessState::Reused
+        );
+        owned
+            .known
+            .insert((identity.pid, identity.token.clone()), identity.clone());
+        assert!(!owned.signal_descendants(libc::SIGTERM));
+        assert!(!inspect(helper.id() as i32).expect("helper survives").zombie);
+
+        identity = captured;
+        identity.birth += 1.0;
+        assert_eq!(
+            OwnedProcess::descendant_state(&identity),
+            ProcessState::Reused
+        );
+        owned
+            .known
+            .insert((identity.pid, identity.token.clone()), identity.clone());
+        assert!(!owned.signal_descendants(libc::SIGTERM));
+        assert!(!inspect(helper.id() as i32).expect("helper survives").zombie);
+
+        identity.token.clear();
+        assert_eq!(
+            OwnedProcess::descendant_state(&identity),
+            ProcessState::Unknown
+        );
+        owned
+            .known
+            .insert((identity.pid, identity.token.clone()), identity);
+        assert!(!owned.signal_descendants(libc::SIGKILL));
+        assert_eq!(owned.descendants_gone(), Some(false));
+        assert!(!inspect(helper.id() as i32).expect("helper survives").zombie);
+        helper.kill().expect("stop helper");
+        helper.wait().expect("reap helper");
+        leader.kill().expect("stop leader");
+        leader.wait().expect("reap leader");
+    }
+
+    /// An unverified group does not block safe individual cleanup, but the
+    /// final outcome cannot claim confirmed ownership teardown.
+    #[tokio::test]
+    async fn unknown_group_still_cleans_verified_descendant_without_confirmation() {
+        use std::os::unix::process::CommandExt;
+
+        let mut helper = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .map(TestChild)
+            .expect("spawn helper");
+        let mut leader = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .map(TestChild)
+            .expect("spawn leader");
+        let mut owned = OwnedProcess::capture(leader.id() as i32);
+        let identity = inspect(helper.id() as i32).expect("inspect helper");
+        owned
+            .known
+            .insert((identity.pid, identity.token.clone()), identity);
+        owned.leader = None;
+        assert_eq!(owned.group_observation(), GroupObservation::Unknown);
+
+        let result = owned.cleanup(std::time::Duration::from_millis(50)).await;
+        let helper_exited = helper.try_wait().expect("observe helper").is_some();
+        if !helper_exited {
+            helper.kill().expect("stop surviving helper");
+        }
+        helper.wait().expect("reap helper");
+        leader.kill().expect("stop unverified leader");
+        leader.wait().expect("reap leader");
+        assert!(
+            helper_exited,
+            "captured helper should receive an individual signal"
+        );
+        assert!(result.is_err(), "unknown group cannot confirm cleanup");
+    }
+}

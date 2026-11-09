@@ -1,0 +1,14 @@
+[Unit]
+Description=Collect one agent-quota source under its credential owner (%i)
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+EnvironmentFile=/etc/agent-quota/probes/%i.env
+StateDirectory=agent-quota-owner-collect
+StateDirectoryMode=0700
+KillMode=control-group
+TimeoutStartSec=15min
+TimeoutStopSec=10s
+ExecStart=/usr/bin/env -i AQ_BINARY=${AQ_BINARY} AQ_CONFIG=${AQ_CONFIG} AQ_SOCKET=${AQ_SOCKET} AQ_SERVICE_USER=${AQ_SERVICE_USER} AQ_SERVICE_TMP=${AQ_SERVICE_TMP} AQ_PROBE_USER=${AQ_PROBE_USER} AQ_PROBE_OS_HOME=${AQ_PROBE_OS_HOME} AQ_PROBE_PRIVATE_HOME=${AQ_PROBE_PRIVATE_HOME} AQ_PROBE_TMP=${AQ_PROBE_TMP} AQ_PROBE_PATH=${AQ_PROBE_PATH} AQ_ACCOUNT=${AQ_ACCOUNT} AQ_PROVIDER=${AQ_PROVIDER} AQ_SOURCE=${AQ_SOURCE} /bin/bash /usr/local/libexec/agent-quota-owner-collect

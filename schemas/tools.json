@@ -1,0 +1,47 @@
+[
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Report the product identity and scaffold qualification status. Read-only; does not access files or external services.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    },
+    "name": "get_status"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Read stored quota metrics from the local service. Does not contact providers or start models. Narrow account or model scope if the result is too large.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "accounts": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 256,
+          "type": "array"
+        },
+        "model": {
+          "maxLength": 256,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "name": "get_quota"
+  }
+]

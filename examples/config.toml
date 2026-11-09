@@ -1,0 +1,26 @@
+# Replace every example path and model ID before use. This file contains no token values.
+# Export collector files first with: agent-quota export-assets --directory /ABSOLUTE/PRIVATE/PARENT/quota-assets
+interval_seconds = 300
+sample_retention = 1000
+
+[[sources]]
+account = "account-example"
+provider = "codex"
+auth_family = "openai"
+credential = "native:codex"
+native_directory = "/ABSOLUTE/PATH/TO/CODEX-HOME"
+models = [{ id = "replace-with-configured-model" }]
+
+[sources.harness]
+id = "codex"
+binary = "/ABSOLUTE/PATH/TO/CODEX"
+
+[sources.collector]
+command = "/bin/bash"
+args = ["/ABSOLUTE/PRIVATE/PARENT/quota-assets/collectors/codex.sh"]
+source = "codex-appserver"
+timeout_seconds = 30
+
+# For an unobserved account, use limits_source = "none" and omit the collector.
+# For a separate credential-owning UID, use execution = "external" and the
+# probe/ingest procedure in docs/api.md; no credential is read by the service.
