@@ -42,7 +42,8 @@ ingest acknowledgement. An older ingest may therefore finish after a later
 probe, or a collector may outlive an abnormal termination. This can temporarily
 produce stale or contradictory quota facts; the launcher does not claim an
 idempotent receipt or a cross-process transaction. `KillMode=control-group`
-helps systemd stop its children, but has not been qualified on a live host.
+helps systemd stop its children; the real-child timeout and cgroup cleanup were
+observed on dobi (see below).
 
 Synthetic launcher tests cover handoff arguments, lock, failure and size
 boundaries. A separate same-UID test invokes the real `probe` and `ingest`
@@ -52,9 +53,16 @@ the service could not read the owner's synthetic secret, and exercised allowed
 reads, rejected writes and a rejected unlisted UID. That container had no
 network or host mounts and used a synthetic PAM configuration.
 
-The actual host's PAM policy and the root-managed launcher's systemd lifecycle,
-real Claude and GLM logins, and macOS Keychain behavior remain unverified. An
-isolated same-UID user-systemd service on dobi successfully collected real
-Codex quota metadata; that does not qualify this separate two-UID launcher.
+On dobi (Ubuntu 24.04.5 LTS x86-64), a privileged qualification (run
+`9e478e83da01`, all observations passed) ran the launcher through the host's
+PAM `runuser` and systemd with four distinct UIDs: credential and socket DAC
+denials, peer-UID denial, a hung child ended by `TimeoutStartSec` with its
+cgroup removed, a later run succeeding, and a clean serve stop. It used a
+synthetic fixture provider and an earlier candidate binary (SHA-256 `2d3c142b`)
+of the same source line, not the exact release bytes. Separately, the real
+Claude quota-metadata endpoint was read once by the executing user's own native
+login (no model turn), and an isolated same-UID user-systemd service collected
+real Codex quota metadata. Real GLM logins, other hosts and macOS Keychain
+behavior remain unverified.
 Do not remove an existing Run launcher or change its live paths until the
 operator has reviewed and verified the replacement for that deployment.

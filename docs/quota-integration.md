@@ -4,7 +4,7 @@ Status: the owner decisions and product boundary below were reviewed with the
 agent-run collaborator. A resident service, local store, quota calculations,
 CLI/MCP, and a versioned local API are implemented and exercised with synthetic
 collectors. Source-level agent-run integration has synthetic coverage; deployment
-and Linux launcher qualification remain open. Automatic Bridge notifications are
+remains open; the Linux launcher is qualified on dobi only. Automatic Bridge notifications are
 deferred, and the owner chose not to import old quota history.
 
 ## Product boundary
@@ -82,10 +82,11 @@ external Rust callers of removed internal APIs must migrate. Historical tables,
 migrations and retired operation formats remain for compatibility and receipt
 replay, while new requests for retired quota writes are rejected. Existing
 installations were not changed and may still have the old Linux launcher. The
-new launcher passed an isolated two-UID synthetic test but is not yet qualified
-for a live deployment. A separate same-UID user-systemd service on dobi
+new launcher passed an isolated two-UID synthetic test and a privileged two-UID
+PAM/systemd qualification on dobi (run `9e478e83da01`, earlier candidate of the
+same source line); no live deployment was changed. A separate same-UID user-systemd service on dobi
 collected a real Codex quota observation and returned it through the local API;
-that check did not start a model or qualify the cross-UID launcher.
+that check did not start a model.
 Automatic warning thresholds remain undecided.
 
 Include the calculation time, its validity bound, and calculation identity.
@@ -238,10 +239,14 @@ those snapshots; two duplicate-version and three unused-license-allowance
 warnings remain within the existing policy.
 These results do not establish GitHub CI provenance or qualify a later package.
 
-The root-managed two-UID systemd launcher and host PAM have not been tested on
-the actual host, nor have real Claude or GLM logins. The Linux CI workflow has
-been reviewed locally but not run in GitHub. No live deployment, release,
-credential store or existing agent-run state was changed by these checks.
+Later evidence on dobi (Ubuntu 24.04.5 LTS x86-64), all from earlier candidates of
+this source line rather than the release bytes: a real Codex quota metadata read
+(candidate `3a704d5`); a real Claude quota metadata read by the executing user's
+native login on 2026-11-09 (candidate binary SHA-256 `2d3c142b`, no model turn); and
+a privileged two-UID PAM/systemd launcher qualification of that same candidate
+(run `9e478e83da01`, all observations passed). Real GLM logins and macOS were not
+tested. The Linux CI workflow ran on GitHub for the published source. No live
+deployment, credential store or existing agent-run state was changed by these checks.
 
 ## Open decisions
 

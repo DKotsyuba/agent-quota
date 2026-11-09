@@ -160,5 +160,5 @@ The two commands do not switch UID, install a scheduler, change permissions, or
 read another user's login. An optional [Linux launcher example](linux-owner-collection.md)
 is provided for a root-managed scheduler; it is not installed or enabled by
 Quota. The operator must arrange its trusted configuration, private worker home,
-and separate execution identities. The real cross-UID and macOS paths have not
-been qualified by the synthetic tests in this repository.
+and separate execution identities. The synthetic tests in this repository do not qualify the real cross-UID path;
+it was qualified separately on dobi (see the Linux launcher document). macOS is unqualified.

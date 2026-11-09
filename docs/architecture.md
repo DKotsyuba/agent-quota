@@ -22,7 +22,9 @@ the owner chose automatic continuation after uncertain outcomes. Synthetic tests
 exercise the actual launcher with distinct UIDs in a network-isolated container.
 On dobi, the packaged service also ran under the user systemd manager with an
 isolated home and obtained a real Codex quota observation through its API. The
-root-managed launcher's host PAM and systemd lifecycle remain unqualified.
+root-managed launcher's host PAM and systemd lifecycle passed a privileged two-UID
+qualification on dobi (Ubuntu 24.04.5 LTS x86-64) with an earlier candidate of the
+same source line, not the exact release bytes. Other hosts remain unqualified.
 
 Forecasts and advisory recommendations retain the agent-run calculation rules.
 Unknown, expired, failed, and exhausted observations remain distinguishable.
@@ -40,8 +42,8 @@ MCP definitions remain Rust-authoritative in `src/tools/mod.rs`, with the
 reviewed export in `schemas/tools.json`. MCP text uses bounded typed views and
 embedded MiniJinja templates; machine clients use the JSON socket or CLI.
 Agent-run's client, admission, account switching and public reads have synthetic
-coverage. The source-level transition is not deployed, and Linux launcher
-qualification remains unfinished.
+coverage. The source-level transition is not deployed; the Linux launcher was qualified
+on dobi only (see the dobi verification section of the integration design).
 Automatic Agent Bridge warning delivery is deferred. Existing
 quota history is intentionally not imported. See
 [integration design](quota-integration.md) for the remaining scope.

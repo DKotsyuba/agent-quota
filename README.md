@@ -3,10 +3,10 @@
 `agent-quota` collects provider quota observations into its own local database,
 computes the existing `agent-run` forecasts and advice, and serves them through
 a local API, CLI, and stdio MCP. On dobi, an isolated user-systemd service
-collected real Codex quota metadata and returned it through the local API.
+collected real Codex quota metadata and returned it through the local API, and the
+separate root-managed two-UID Linux launcher passed a host PAM/systemd qualification.
 Source-level integration with `agent-run` has been exercised with synthetic data;
-it has not been deployed, and qualification of the separate root-managed Linux
-launcher remains open. Automatic Agent Bridge notifications are deferred.
+it has not been deployed. Automatic Agent Bridge notifications are deferred.
 Existing quota history is intentionally not imported.
 
 The [integration design](docs/quota-integration.md) records the migration
@@ -113,7 +113,7 @@ a retained compatible version. Quota data are stored outside `standalone/`; exte
 not undone by a binary rollback. No automatic pruning or removal of user data.
 The single-binary bundle contains the collector and launcher bytes. Exporting or
 installing those files remains an explicit operator action, separate from binary
-installation and service registration. Release publication remains disabled.
+installation and service registration.
 
 CI restores Cargo dependency builds and a versioned cargo-deny tool cache. Successful
 main check jobs warm the check cache; an independent package job (main pushes and manual
@@ -129,10 +129,10 @@ compiler, dependency and build-setting changes invalidate the relevant cache.
 Release packages and their integrity/acceptance evidence remain separate artifacts.
 
 The release workflow targets Linux x86-64 on Ubuntu 24.04; macOS remains an
-unqualified candidate. The release source check and exact payload build run in
+unqualified candidate and no macOS support is claimed. The release source check and exact payload build run in
 parallel. Publication waits for both to succeed, then preserves environment approval and tests the
-downloaded payload's exact bytes. Packaging does not enable release publication
-or establish native host qualification.
+downloaded payload's exact bytes. Packaging alone does not enable release publication
+or establish native host qualification; both are recorded in family.toml.
 
 Third-party licenses: `LICENSE` is the MIT license of this source. `THIRD_PARTY_NOTICES` is
 generated from the locked dependency set and the crate sources Cargo unpacked
@@ -141,7 +141,8 @@ dependency without a license text, or on a non-registry source). Both files are 
 separate release assets beside the binary, manifest and installer and are listed in
 `SHA256SUMS`; they are not part of the strict two-file bundle, which still rejects extras.
 
-The release workflow is guarded by release.enabled=false and qualification settings in family.toml.
+The release workflow is guarded by release.enabled and the qualification settings in family.toml
+(`verified`, `x86_64-unknown-linux-gnu`, and the dobi host). Evidence for `x86_64-unknown-linux-gnu` on dobi (Ubuntu 24.04.5 LTS x86-64) comes from earlier candidates of the same source line, not the exact release bytes: a real Codex quota metadata read through an isolated same-UID user-systemd service (candidate `3a704d5`), a real Claude quota metadata read by the executing user's own native login (candidate binary SHA-256 `2d3c142b`, 2026-11-09), and a privileged two-UID PAM/systemd launcher qualification of that same candidate (run `9e478e83da01`, all observations passed). No model turn was started. Real GLM logins and macOS were not tested.
 Version preparation is `cargo xtask release prepare VERSION --apply`; inspect/commit the changes,
 then create and push an annotated tag yourself. Publishing tests the exact shipped executable.
 
