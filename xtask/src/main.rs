@@ -390,8 +390,14 @@ impl Project {
                 "-D",
                 "warnings",
             ],
-            vec!["test", "--frozen", "--workspace"],
-            vec!["test", "--frozen", "--workspace", "--all-features"],
+            vec!["test", "--frozen", "--workspace", "--no-fail-fast"],
+            vec![
+                "test",
+                "--frozen",
+                "--workspace",
+                "--all-features",
+                "--no-fail-fast",
+            ],
         ] {
             if self.has_features || args.contains(&"--all-features") {
                 run(&self.root, "cargo", &args)?;
