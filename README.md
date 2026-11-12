@@ -88,11 +88,11 @@ directly, then check the changed crate or run its relevant test target:
 ```bash
 cargo fmt --all --check
 cargo check --frozen -p agent-quota --all-targets --all-features
-cargo test --frozen -p agent-quota --all-features --test protocol
+cargo nextest run --frozen -p agent-quota --all-features -E 'test(/^protocol::/)'
 ```
 
 Select the changed workspace crate and test filter as appropriate. These focused
-commands give early feedback; finish a coherent change with `cargo xtask check`
+commands give early feedback; finish a coherent change with `cargo xtask check` (requires cargo-nextest)
 and its applicable protocol/presentation/delivery checks before a PR. Changes to
 embedded templates or other compile-time assets require the same checks as code.
 Optimized packaging belongs to delivery, not every edit iteration.

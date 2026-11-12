@@ -200,6 +200,11 @@ fn publish(project: &Project, directory: PathBuf) -> Result<()> {
     if !incomplete.is_empty() {
         return Err("unimplemented tools block release".into());
     }
+    require_tests(
+        &project.root,
+        &project.name,
+        &["protocol::", "assets::", "collectors::", "service::"],
+    )?;
     for args in [
         vec!["deny", "--locked", "--workspace", "check"],
         vec![
@@ -561,6 +566,30 @@ pub fn execute(project: &Project, command: Release) -> Result<()> {
         } => wait(project, &repo, &tag, &commit, timeout, result_file),
     }
 }
+
+/// Fails unless each libtest filter selects at least one test of the `it`
+/// binary, so a renamed module cannot turn acceptance into a run of zero tests.
+fn require_tests(root: &Path, package: &str, filters: &[&str]) -> Result<()> {
+    for filter in filters {
+        let output = Command::new("cargo")
+            .current_dir(root)
+            .args([
+                "test", "--frozen", "-p", package, "--test", "it", "--", "--list", filter,
+            ])
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .output()?;
+        let selected = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| line.ends_with(": test"))
+            .count();
+        if !output.status.success() || selected == 0 {
+            return Err(format!("acceptance filter `{filter}` selects no tests").into());
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, reason = "Test assertions fail explicitly")]
 mod tests {
