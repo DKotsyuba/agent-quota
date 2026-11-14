@@ -63,6 +63,18 @@ const ASSETS: &[Asset] = &[
     },
     Asset {
         directory: "collectors",
+        name: "opencode-go.sh",
+        bytes: include_bytes!("../scripts/collectors/opencode-go.sh"),
+        executable: true,
+    },
+    Asset {
+        directory: "collectors",
+        name: "opencode-go.jq",
+        bytes: include_bytes!("../scripts/collectors/opencode-go.jq"),
+        executable: false,
+    },
+    Asset {
+        directory: "collectors",
         name: "common.jq",
         bytes: include_bytes!("../scripts/collectors/common.jq"),
         executable: false,

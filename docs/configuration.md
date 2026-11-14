@@ -49,7 +49,7 @@ Supported references are:
 The service does not create logins or change credential permissions. A service
 running under one UID cannot read a private store owned by another UID; use the
 external-probe path with a separately authorized launcher where needed. The
-supplied Codex, Claude and GLM scripts are copied from agent-run and require jq;
+supplied Codex, Claude, GLM and OpenCode Go scripts require jq;
 the HTTP scripts also require curl. Use `agent-quota export-assets --directory`
 to create a new owner-private export from the running binary, then configure the
 absolute script path under its `collectors/` directory. The command never
@@ -65,6 +65,24 @@ Configured collectors execute as trusted code. When the context includes a
 direct token, the output check rejects that exact token in JSON keys and strings.
 Native-login directory references supply no token to this check; it also cannot
 prove the absence of an encoded or partial leak.
+
+## OpenCode Go source
+
+The `opencode-go.sh` collector reads the undocumented account-level usage endpoint
+`GET https://opencode.ai/inference/go/v1/usage` with `Authorization: Bearer <key>`
+from a `file:`/`env:` token credential. Declare `auth_family`, `harness` and the
+provider id exactly as the Agent Run provider does (for a Go key used through
+Claude Code: `auth_family = "anthropic"`, `harness.id = "claude-code"`); the
+harness binary is only passed through to the collector, never run by it.
+Its `usage.rolling`, `usage.weekly` and `usage.monthly` windows (5 hours, 7 days and
+the full month; `percent` is percent **used**) become the `five_hour`, `seven_day`
+and `monthly` windows of pool `primary`, with `remaining = 100 - percent`, and
+apply to every model of the source. A status other than `ok` is never read as zero
+use: `exhausted`/`limited` report 0 remaining, any other value reports unknown
+remaining. Missing, extra or mistyped windows, a missing reset, or a percent
+outside 0–100 fail the whole observation, which keeps earlier observations.
+Provider limits are dollar-based per model, so the percentages are an
+account-level approximation. See `examples/config.toml`.
 
 ## Interpretation
 

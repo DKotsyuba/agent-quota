@@ -21,6 +21,24 @@ args = ["/ABSOLUTE/PRIVATE/PARENT/quota-assets/collectors/codex.sh"]
 source = "codex-appserver"
 timeout_seconds = 30
 
+# OpenCode Go (undocumented usage endpoint; the key file must be private to its owner).
+# [[sources]]
+# account = "account-opencode-go"
+# provider = "opencode-go"
+# auth_family = "anthropic"   # as in the Agent Run provider
+# credential = "file:/ABSOLUTE/PATH/TO/opencode-go.key"
+# models = [{ id = "replace-with-configured-model" }]
+#
+# [sources.harness]
+# id = "claude-code"
+# binary = "/ABSOLUTE/PATH/TO/CLAUDE"
+#
+# [sources.collector]
+# command = "/bin/bash"
+# args = ["/ABSOLUTE/PRIVATE/PARENT/quota-assets/collectors/opencode-go.sh"]
+# source = "opencode-go-usage"
+# timeout_seconds = 30
+
 # For an unobserved account, use limits_source = "none" and omit the collector.
 # For a separate credential-owning UID, use execution = "external" and the
 # probe/ingest procedure in docs/api.md; no credential is read by the service.
