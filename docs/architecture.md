@@ -13,7 +13,7 @@ strings are checked for that exact token. A native-login directory does not
 supply a token to that check, which also cannot detect encoded or partial leaks;
 configured collector code must therefore be trusted. A failed round
 preserves earlier observations and their original times. The supplied Codex,
-Claude and GLM collectors are external processes. Their source files under
+Claude, GLM and OpenCode Go collectors are external processes. Their source files under
 `scripts/collectors/` are embedded in the binary and may be exported explicitly.
 Collectors normally execute as the service's OS user. An external probe and
 owner-only ingest path can be launched separately under the credential owner.

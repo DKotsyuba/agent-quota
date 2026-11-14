@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- OpenCode Go collector (`collectors/opencode-go.sh` and `.jq`, embedded in the binary): reads the account-level usage endpoint with a bearer key and reports `five_hour`, `seven_day` and `monthly` windows for every configured model; unknown statuses are unknown, schema drift fails closed.
+
 ### Changed
 
 - Stale test scratch cleanup accepts only canonical decimal PIDs and is skipped when the PID namespace is unknown.
