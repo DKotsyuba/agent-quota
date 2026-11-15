@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.1.1
+
+Released 2026-11-15. Qualification in `family.toml` is unchanged from 0.1.0: Linux x86-64 on dobi, evidence from earlier candidates of the same source line, not the exact release bytes. The OpenCode Go collector has not been exercised against a real OpenCode Go login.
+
 ### Added
 
 - OpenCode Go collector (`collectors/opencode-go.sh` and `.jq`, embedded in the binary): reads the account-level usage endpoint with a bearer key and reports `five_hour`, `seven_day` and `monthly` windows for every configured model; unknown statuses are unknown, schema drift fails closed.
