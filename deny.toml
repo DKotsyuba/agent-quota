@@ -1,6 +1,10 @@
 # Reviewed baseline allowlist, not an assertion that every future dependency is acceptable.
 [advisories]
 yanked = "deny"
+# Owner approved 2026-11-18.
+ignore = [
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained (informational, no vulnerability); required by rmcp; re-check by 2027-02-01" },
+]
 
 [licenses]
 allow = ["MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Unicode-3.0", "Zlib"]
