@@ -17,11 +17,25 @@ turns merely to discover quota.
 
 agent-run requests ready-to-use quota data when it needs them. It remains the
 owner of agent launches, provider/model choices, account selection, local
-priority policy, active-attempt accounting, process limits, cleanup, and
-retries. It does not maintain a second quota forecasting implementation or
-become the authoritative quota-history store. A small reference to the quota
-result used for a launch is an integration and audit detail, not another
-source of quota truth.
+admission policy (account enablement, pins, cooldowns), active-attempt
+accounting, process limits, cleanup, and retries. It does not maintain a second
+quota forecasting implementation or become the authoritative quota-history
+store. A small reference to the quota result used for a launch is an
+integration and audit detail, not another source of quota truth.
+
+Owner decision 2026-11-18 (BACKLOG #37–#39): agent-quota is the single place
+that presents quota, limits and capacity. The provider and account ranking
+multipliers and the provider-to-model offering used for ranking are Quota
+configuration ([configuration](configuration.md#capacity-ranking)). Quota
+serves the account-free ranked order through `get_capacity`, the CLI
+`capacity`, the socket method `capacity` and the `hook context`
+UserPromptSubmit block ([API](api.md#capacity-order)). agent-run keeps only its
+admission read: a fresh `snapshot` per decision for `quota_exhausted` refusals
+and account selection. Its `limits`, `capacity_order` and `models` quota
+renderings, the quota lines of `delegation_guide` and its capacity hook block
+are to be removed (agent-run WP3). Until agent-run's admission is changed, its
+own binding multipliers continue to order accounts inside one admission; the
+two copies of the weights must be kept equal during the transition.
 
 ## Service and data flow
 

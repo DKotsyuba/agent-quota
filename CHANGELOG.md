@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Added
+
+- Capacity ranking moved from agent-run: optional source `priority_multiplier` (account weight per provider binding; an account's weight on a model is the maximum of its bindings) and `[providers.<alias>]` tables with `priority_multiplier` and `ordered_accounts`. Omitted values are neutral, so existing configurations stay valid.
+- `get_capacity` MCP tool, `agent-quota capacity` CLI and protocol-v1 socket method `capacity`: account-free ranked providers and models with status `available`, `limited` (known capacity, high risk on every known account), `unknown` or `exhausted`, best priority, remaining percentage, limiting window, reset, risk, evidence freshness and per-window details. It has no account or pool identities. The capacity result has its own `schema_version` 1.
+- `agent-quota hook context`: read-only, fail-soft `UserPromptSubmit` block with the provider capacity order, in the line format of agent-run's former block.
+
+### Changed
+
+- `get_status` describes the product name, version and release qualification instead of the template's "scaffold qualification status".
+
 ## 0.1.1
 
 Released 2026-11-15. Qualification in `family.toml` is unchanged from 0.1.0: Linux x86-64 on dobi, evidence from earlier candidates of the same source line, not the exact release bytes. The OpenCode Go collector has not been exercised against a real OpenCode Go login.

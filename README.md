@@ -18,12 +18,25 @@ Read AGENTS.md and docs/MCP_RESPONSE_STANDARD.md before adding tools.
 
 | Tool | Effect | Purpose |
 |---|---|---|
-| `get_status` | read | product identity and release qualification status |
-| `get_quota` | read | stored quota metrics and advice; optional account/model filters |
+| `get_status` | read | product name, version and release qualification |
+| `get_capacity` | read | account-free provider/model capacity order (highest first) with status, remaining percentage, limiting window, reset and freshness; optional model filter |
+| `get_quota` | read | stored per-account quota metrics and advice; optional account/model filters |
 
-`get_quota` never contacts a provider. Narrow the scope when a result exceeds
-the text response budget. Use CLI JSON or the [local API](docs/api.md) for the
-full machine-readable response.
+Neither tool contacts a provider. `get_capacity` is the orchestrator view: it
+applies the provider and account multipliers from the [configuration](docs/configuration.md)
+and never shows account or pool identities. `get_quota` is the operator view
+with account labels. Narrow the scope when a result exceeds the text response
+budget. Use CLI JSON or the [local API](docs/api.md) for the full
+machine-readable response.
+
+### UserPromptSubmit hook
+
+`agent-quota hook context [--host claude|codex] [--socket PATH] [--server-uid UID] [--max-chars N]`
+prints the compact provider capacity order as a `UserPromptSubmit`
+`additionalContext` envelope (default budget 1899 characters, capped at 2500).
+It reads the local service once with a 750 ms deadline, writes nothing, and
+on any error prints nothing and exits 0. It is stateless, so it injects the
+block on every prompt; agent-run previously injected it only when it changed.
 
 ## Run locally
 
@@ -37,6 +50,8 @@ See [configuration](docs/configuration.md) for account and credential options.
 agent-quota serve --home /absolute/private-home --config /absolute/config.toml
 agent-quota service-status --socket /absolute/private-home/quota.sock
 agent-quota limits --socket /absolute/private-home/quota.sock --account account-example
+agent-quota capacity --socket /absolute/private-home/quota.sock
+agent-quota hook context --socket /absolute/private-home/quota.sock
 agent-quota mcp --socket /absolute/private-home/quota.sock
 ```
 

@@ -1041,6 +1041,73 @@ binary = "/bin/true"
     }
 
     /// Produces the fixed synthetic snapshot used by the consumer contract fixture.
+    /// Capacity applies configured multipliers to stored observations and omits account identities.
+    #[test]
+    fn capacity_ranks_stored_observations_without_accounts() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let home = root.path().join("home");
+        let config_path = root.path().join("config.toml");
+        let source = |account: &str, provider: &str, weight: f64| {
+            format!(
+                "[[sources]]\naccount = \"{account}\"\nprovider = \"{provider}\"\nauth_family = \"openai\"\ncredential = \"native:codex\"\nnative_directory = \"/synthetic\"\npriority_multiplier = {weight:?}\nmodels = [{{ id = \"model-a\" }}]\n[sources.harness]\nid = \"codex\"\nbinary = \"/bin/true\"\n[sources.collector]\ncommand = \"/bin/true\"\nsource = \"fixture-source\"\n"
+            )
+        };
+        std::fs::write(
+            &config_path,
+            [
+                source("private-one", "alpha", 3.0),
+                source("private-two", "beta", 1.0),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        let engine = Engine::open(&home, &config_path).unwrap();
+        let scope = CollectorScope {
+            runtime: "codex".into(),
+            source: "fixture-source".into(),
+            models: BTreeSet::from(["model-a".into()]),
+        };
+        for (name, remaining) in [("private-one", 50), ("private-two", 90)] {
+            let account: AccountId = name.parse().unwrap();
+            let raw = json!({"version":1,"windows":[{"pool":"primary","window":"five_hour",
+                "models":["model-a"],"remaining_percent":remaining,"observed_at":10000,
+                "valid_until":10900,"reset_at":20000}]});
+            let snapshot =
+                normalize_collector_output(&account, &scope, &raw, 10000.0, 256, 256).unwrap();
+            engine
+                .store
+                .lock()
+                .unwrap()
+                .record_snapshot("codex", &snapshot, 1000, 10000.0)
+                .unwrap();
+        }
+        let capacity = engine.capacity_at(None, 10000.0).unwrap();
+        assert_eq!(capacity["schema_version"], 1);
+        assert_eq!(capacity["coverage"]["state"], "unknown");
+        assert_eq!(capacity["coverage"]["incomplete"], true);
+        // Same quota score per account; the 3x account weight puts alpha first.
+        assert_eq!(capacity["providers"][0]["provider"], "alpha");
+        assert_eq!(capacity["providers"][1]["provider"], "beta");
+        let alpha = &capacity["providers"][0]["models"][0];
+        assert_eq!(alpha["status"], "available");
+        assert_eq!(alpha["remaining_percent"], 50.0);
+        assert_eq!(alpha["limiting_window"], "five_hour");
+        assert_eq!(alpha["windows"][0]["known"], true);
+        let text = capacity.to_string();
+        assert!(!text.contains("private-one") && !text.contains("private-two"));
+        assert_eq!(
+            engine.capacity_at(Some("absent"), 10000.0).unwrap_err(),
+            "unknown_model"
+        );
+        let narrowed = engine.capacity_at(Some("model-a"), 10000.0).unwrap();
+        assert_eq!(narrowed["providers"].as_array().unwrap().len(), 2);
+        // After validity expires, the same data is unknown rather than available.
+        let expired = engine.capacity_at(None, 10901.0).unwrap();
+        assert_eq!(expired["providers"][0]["models"][0]["status"], "unknown");
+        assert_eq!(expired["providers"][0]["models"][0]["evidence"], "stale");
+    }
+
     #[test]
     fn snapshot_v2_fixture() {
         let root = tempfile::tempdir().unwrap();
@@ -1205,6 +1272,7 @@ pub(crate) async fn serve(
                 let result = match request.method.as_str() {
                     "status" => api_engine.status(),
                     "snapshot" => api_engine.snapshot(&request.accounts, request.model.as_deref()),
+                    "capacity" => api_engine.capacity(request.model.as_deref()),
                     "ingest" => request
                         .observation
                         .ok_or("invalid_observation")
@@ -1720,10 +1788,45 @@ impl Engine {
         model_filter: Option<&str>,
         at: f64,
     ) -> Result<Value, &'static str> {
+        let settings = self.settings.lock().map_err(|_| "internal_error")?;
+        self.snapshot_locked(&settings, accounts, model_filter, at)
+    }
+
+    /// Ranks every configured provider and model without exposing account identities.
+    pub(crate) fn capacity(&self, model_filter: Option<&str>) -> Result<Value, &'static str> {
+        self.capacity_at(model_filter, now())
+    }
+
+    /// Builds the account-free capacity order from one snapshot and the same configuration.
+    fn capacity_at(&self, model_filter: Option<&str>, at: f64) -> Result<Value, &'static str> {
+        let settings = self.settings.lock().map_err(|_| "internal_error")?;
+        if let Some(wanted) = model_filter
+            && !settings.config.sources.iter().any(|source| {
+                source
+                    .models
+                    .iter()
+                    .any(|model| wanted == model.id || wanted == model.lane())
+            })
+        {
+            return Err("unknown_model");
+        }
+        let snapshot = self.snapshot_locked(&settings, &[], model_filter, at)?;
+        let view =
+            crate::capacity::rank(&settings.config, snapshot, at).map_err(|_| "internal_error")?;
+        serde_json::to_value(view).map_err(|_| "internal_error")
+    }
+
+    /// Builds a snapshot under already locked settings so derived views share one configuration.
+    fn snapshot_locked(
+        &self,
+        settings: &Settings,
+        accounts: &[String],
+        model_filter: Option<&str>,
+        at: f64,
+    ) -> Result<Value, &'static str> {
         if accounts.len() > 256 {
             return Err("invalid_scope");
         }
-        let settings = self.settings.lock().map_err(|_| "internal_error")?;
         let configured: BTreeSet<AccountId> = settings
             .config
             .sources
