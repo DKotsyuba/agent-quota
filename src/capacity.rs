@@ -20,7 +20,7 @@ pub(crate) const HOOK_HARD_LIMIT_CHARS: usize = 2500;
 /// Default hook budget: agent-run's priority slot (2500 - 600 active - 1 separator).
 pub(crate) const HOOK_DEFAULT_CHARS: usize = 1899;
 /// Header of the compact hook block; wording follows agent-run's former block.
-const HOOK_HEADER: &str = "Provider capacity order (highest first; read-only; agent-quota). Pick provider, model, effort and profile yourself; use the agent-run delegation guide for roles and recommendations and agent-quota get_capacity for windows and resets. unknown = quota cannot be determined from available data, not a health claim; limited = known capacity at high quota risk.";
+const HOOK_HEADER: &str = "Provider capacity order (highest first; read-only). Pick provider, model, effort and profile yourself; agent-quota get_capacity has windows and resets. unknown = quota cannot be determined from available data, not a health claim; limited = known capacity at high quota risk.";
 /// Omission instruction appended when complete provider lines do not fit.
 const HOOK_OMITTED: &str = "More routes omitted; use agent-quota get_capacity if needed";
 

@@ -33,7 +33,7 @@ pub fn templates() -> Vec<(&'static str, &'static str)> {
         ),
         (
             "capacity",
-            "Capacity order at {{ evaluated_at }} | coverage: {{ coverage }}{% if incomplete %} (incomplete){% endif %}\n{% for provider in providers %}{{ provider.rank }}. {{ provider.provider }} | status: {{ provider.status }} | score: {{ provider.score }} | multiplier: {{ provider.multiplier }}\n{% for model in provider.models %}   {{ model.model }} | {{ model.status }} | remaining: {{ model.remaining }}{% if model.window %} ({{ model.window }}){% endif %} | reset: {{ model.reset }} | risk: {{ model.risk }} | evidence: {{ model.evidence }} | observed: {{ model.observed }}\n{% endfor %}{% else %}No configured providers in scope.\n{% endfor %}",
+            "Capacity order at {{ evaluated_at }} | coverage: {{ coverage }}\n{% for provider in providers %}{{ provider.rank }}. {{ provider.provider }} | status: {{ provider.status }} | score: {{ provider.score }} | multiplier: {{ provider.multiplier }}\n{% for model in provider.models %}   {{ model.model }} | {{ model.status }} | remaining: {{ model.remaining }}{% if model.window %} ({{ model.window }}){% endif %} | reset: {{ model.reset }} | risk: {{ model.risk }} | evidence: {{ model.evidence }} | observed: {{ model.observed }}\n{% endfor %}{% else %}No configured providers in scope.\n{% endfor %}",
         ),
         // xtask:templates
     ]
@@ -328,8 +328,8 @@ struct CapacityModel {
 #[derive(Serialize)]
 struct CapacityPage {
     evaluated_at: f64,
+    /// Coverage state with an `(incomplete)` marker when any model is unknown.
     coverage: String,
-    incomplete: bool,
     providers: Vec<CapacityProviderRow>,
 }
 #[derive(Serialize)]
@@ -413,10 +413,14 @@ fn capacity_view(value: Value) -> Result<CapacityPage, &'static str> {
             models,
         });
     }
+    let coverage = if capacity.coverage.incomplete {
+        format!("{} (incomplete)", capacity.coverage.state)
+    } else {
+        capacity.coverage.state
+    };
     Ok(CapacityPage {
         evaluated_at: capacity.evaluated_at,
-        coverage: capacity.coverage.state,
-        incomplete: capacity.coverage.incomplete,
+        coverage,
         providers,
     })
 }
@@ -529,7 +533,10 @@ mod tests {
         assert_eq!(page.providers[0].models[0].remaining, "unknown");
         let templates = Templates::new(&templates()).unwrap();
         let text = templates.render("capacity", &page).unwrap();
-        assert!(text.contains("coverage: partial (incomplete)"));
+        assert!(
+            text.contains("coverage: partial (incomplete)\n1. "),
+            "{text}"
+        );
         assert!(!text.contains('\u{202e}'));
         let mut invalid = capacity.clone();
         invalid["providers"][0]["models"][0]["status"] = json!("priority_overflow");
