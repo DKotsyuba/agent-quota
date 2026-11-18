@@ -10,6 +10,7 @@ use crate::{
         AccountId, CollectorScope, MAX_OUTPUT_MODELS, MAX_OUTPUT_WINDOWS,
         normalize_collector_output,
     },
+    refresh,
     store::{AccountQuotaHistory, ExhaustionLatch, QuotaStore, StoreError, StoredWindow},
 };
 use serde::Serialize;
@@ -279,6 +280,9 @@ impl Engine {
                 }
             } else {
                 let outcome = async {
+                    refresh::renew_if_due(source, &self.home, at)
+                        .await
+                        .map_err(str::to_owned)?;
                     let context = source.context(at).map_err(str::to_owned)?;
                     let raw = collector::run(binding, &context, &self.home).await?;
                     if credentials::output_contains_credential(&raw, &context) {

@@ -39,6 +39,30 @@ timeout_seconds = 30
 # source = "opencode-go-usage"
 # timeout_seconds = 30
 
+# Claude subscription login. refresh_oauth lets the configured Claude CLI renew the
+# OAuth login (one isolated tiny haiku turn, at most six per day) when it is within
+# five minutes of expiry and a collection is due; omit it to only report
+# credential_expired.
+# [[sources]]
+# account = "account-claude"
+# provider = "claude"
+# auth_family = "anthropic"
+# credential = "named:claude-code:LABEL"
+# app_home = "/ABSOLUTE/PATH/TO/.agent-run"
+# models = [{ id = "replace-with-configured-model" }]
+#
+# [sources.harness]
+# id = "claude-code"
+# binary = "/ABSOLUTE/PATH/TO/CLAUDE"
+# home = "/ABSOLUTE/PATH/TO/.agent-run/service-runtime/claude"
+# refresh_oauth = true
+#
+# [sources.collector]
+# command = "/bin/bash"
+# args = ["/ABSOLUTE/PRIVATE/PARENT/quota-assets/collectors/claude.sh"]
+# source = "claude-oauth-usage"
+# timeout_seconds = 30
+
 # For an unobserved account, use limits_source = "none" and omit the collector.
 # For a separate credential-owning UID, use execution = "external" and the
 # probe/ingest procedure in docs/api.md; no credential is read by the service.

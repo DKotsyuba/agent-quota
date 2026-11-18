@@ -435,9 +435,12 @@ source = "fixture-source"
     let mut wrapper_command = Command::new("/bin/bash");
     wrapper_command
         .arg("-c")
-        .arg(r#"source "$1"; run_as() { shift; /usr/bin/env -i "$@"; }; collect"#)
+        .arg(
+            r#"source "$1"; lock_directory="$2"; run_as() { shift; /usr/bin/env -i "$@"; }; collect"#,
+        )
         .arg("fixture")
         .arg(wrapper)
+        .arg(root.path())
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("HOME", root.path())

@@ -4,6 +4,7 @@ set -euo pipefail
 source "$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)/agent-quota-owner-collect.sh"
 fixture=${AQ_TEST_TMP:?}
 mkdir "$fixture/lock"
+lock_directory="$fixture/lock"
 
 if [[ $(/usr/bin/stat -c '%u' /usr/bin/env) == 0 ]]; then
     trusted_path /usr/bin/env file
@@ -77,7 +78,7 @@ run_as() {
             printf '%s\n' '{"version":1,"observation":{"synthetic":true}}'
         fi
         if [[ -e $fixture/probe-fail ]]; then
-            printf '%s\n' 'synthetic-private-diagnostic' >&2
+            printf '%s\n' "$(<"$fixture/probe-fail")" >&2
             return 1
         fi
     else
@@ -98,14 +99,25 @@ done < "$fixture/probe-args"
 (( found == 1 ))
 [[ $(<"$fixture/observation") == '{"version":1,"observation":{"synthetic":true}}' ]]
 
+[[ ! -e $fixture/lock/probe-diagnostic ]]
 rm "$fixture/ingest-calls"
-: > "$fixture/probe-fail"
-if collect 2>"$fixture/error"; then
-    printf '%s\n' 'late probe failure was accepted' >&2
-    exit 1
-fi
-[[ ! -e $fixture/ingest-calls ]]
-[[ $(<"$fixture/error") == 'quota owner collection: probe failed' ]]
+# Only allowlisted fixed codes reach the journal; other diagnostics stay generic.
+for diagnostic in 'synthetic-private-diagnostic' 'quota probe: SYNTHETIC_SECRET_CANARY' \
+    'quota probe: credential_expired' 'quota probe: credential_refresh_failed' \
+    'quota probe: credential_refresh_limited'; do
+    printf '%s\n' "$diagnostic" > "$fixture/probe-fail"
+    if collect 2>"$fixture/error"; then
+        printf '%s\n' 'late probe failure was accepted' >&2
+        exit 1
+    fi
+    [[ ! -e $fixture/ingest-calls && ! -e $fixture/lock/probe-diagnostic ]]
+    case $diagnostic in
+        'quota probe: credential_'*)
+            expected="quota owner collection: probe failed: ${diagnostic#quota probe: }" ;;
+        *) expected='quota owner collection: probe failed' ;;
+    esac
+    [[ $(<"$fixture/error") == "$expected" ]]
+done
 rm "$fixture/probe-fail"
 
 : > "$fixture/oversize"

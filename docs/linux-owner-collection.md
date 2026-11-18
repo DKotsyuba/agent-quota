@@ -37,6 +37,23 @@ An administrator must review and arrange the deployment separately:
 The launcher waits for a successful bounded probe before a single ingest. It
 does not print the observation or child diagnostics. Normal collection errors
 and an unknown ingest result fail that invocation; the timer can try again.
+The probe's diagnostic line is written to a root-private file in the lock
+directory and removed after the run. Only an allowlisted fixed code is appended
+to the journal message, for example
+`quota owner collection: probe failed: credential_expired`,
+`...: credential_refresh_failed` or `...: credential_refresh_limited`; any other
+diagnostic yields the generic `probe failed`.
+
+For a Claude login, `refresh_oauth = true` in the source's `[sources.harness]`
+lets the probe renew a token near expiry through one isolated print-mode turn of
+the configured Claude CLI (see
+[Claude OAuth renewal](configuration.md#claude-oauth-renewal)). The CLI then runs
+as the credential owner, so `AQ_PROBE_PATH` and `AQ_PROBE_OS_HOME` must suit that
+CLI; the probe's private home holds its working and temporary directories, the
+single-flight lock and the attempt ledger. The probe env file needs no other
+change. The CLI writes the login store itself; Quota does not change its owner
+or mode. A renewal adds at most 90 seconds to a probe, well inside the unit's
+15-minute deadline.
 The owner chose automatic continuation even after an interrupted probe or lost
 ingest acknowledgement. An older ingest may therefore finish after a later
 probe, or a collector may outlive an abnormal termination. This can temporarily

@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Added
+
+- Claude OAuth renewal (`refresh_oauth = true` in `[sources.harness]`, Claude logins only): when a collection is due and the token is within five minutes of expiry, Quota runs one isolated print-mode turn of the configured Claude CLI (haiku, no tools, MCP, hooks, settings sources, slash commands or saved session; null stdio; restricted environment; 90-second bound), so Claude Code renews its own login under its refresh lock before that tiny request. Runs are single-flight per Quota home and capped at six per login per trailing 24 hours by a private ledger. Quota reads only the new expiry; it never exchanges or writes tokens. Renewal through the real CLI against a real login has not been exercised.
+
+### Changed
+
+- A Claude OAuth token past its recorded `expiresAt` is no longer sent to the provider; collection fails with `credential_expired`, `credential_refresh_failed` when an attempted renewal left it expired, or `credential_refresh_limited` when the renewal cap prevented an attempt.
+- The owner-collection launcher appends an allowlisted probe failure code to its journal message (for example `probe failed: credential_expired`); other diagnostics stay private.
+
 ## 0.1.1
 
 Released 2026-11-15. Qualification in `family.toml` is unchanged from 0.1.0: Linux x86-64 on dobi, evidence from earlier candidates of the same source line, not the exact release bytes. The OpenCode Go collector has not been exercised against a real OpenCode Go login.

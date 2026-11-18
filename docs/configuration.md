@@ -66,6 +66,56 @@ direct token, the output check rejects that exact token in JSON keys and strings
 Native-login directory references supply no token to this check; it also cannot
 prove the absence of an encoded or partial leak.
 
+## Claude OAuth renewal
+
+A Claude Code OAuth access token expires a few hours after its last renewal, and
+only the Claude CLI renews it, normally while a Claude agent runs. A Claude token
+whose recorded `expiresAt` has passed is never sent to the provider: the
+collection fails with `credential_expired`.
+
+Set `refresh_oauth = true` in `[sources.harness]` (only for `native:claude-code` or
+`named:claude-code:<label>` credentials) to let the configured harness `binary`
+renew the login. Only when a collection is due and the token is within five
+minutes of expiry (Claude Code's own renewal window), Quota runs, as the
+executing user:
+
+```text
+<binary> -p --model haiku --tools "" --strict-mcp-config --no-session-persistence \
+  --disable-slash-commands --setting-sources "" --settings '{"disableAllHooks":true}' \
+  --system-prompt "Reply with OK." -- "Reply with OK."
+```
+
+Claude Code awaits its OAuth renewal before that single small model request,
+under the same cross-process refresh lock its agents use, and writes its own
+store with its own permissions. The turn therefore uses a tiny amount of the
+subscription. It has no tools, no MCP servers, no hooks, no user/project/local
+settings (and so no plugins), no slash commands and no saved session; managed
+policy settings still apply. stdin, stdout and stderr are null, so nothing the
+CLI prints is read or logged. The working and temporary directories are the
+private Quota home, the environment is the collector's restricted one plus
+`CLAUDE_CONFIG_DIR` naming the selected login (for named or explicitly located
+logins) and `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`. The run is bounded to
+90 seconds and its process group is cleaned up. Quota never exchanges, copies or
+writes a token, contacts no endpoint itself, and reads only the new expiry.
+`claude auth status` is deliberately not used: in Claude Code 2.1.322 its renewal
+runs unawaited, so the process can exit while a rotated token is still unsaved.
+
+Renewal is single-flight: a non-blocking lock (`oauth-renewal.lock`) in the
+private Quota home skips the CLI while another renewal runs. At most six CLI
+runs per login are started in any trailing 24 hours; the private ledger
+`oauth-renewals.json` in the same home records only attempt times under a digest
+of the login path. A corrupt, foreign-owned or non-private ledger refuses
+renewal rather than lifting the cap; remove it to reset.
+
+The CLI's exit status does not report renewal; the store does. If the token is
+still valid but was not renewed, collection proceeds and the next due collection
+tries again. If it has expired, the collection fails with
+`credential_refresh_failed`, with `credential_refresh_limited` when the cap (or an
+unusable ledger) prevented the attempt, or with `credential_expired` when the
+store has no refresh token (the CLI is then not started). A store without
+`expiresAt` (for example a long-lived token) is never renewed. With service
+execution, failures also count toward collector backoff.
+
 ## OpenCode Go source
 
 The `opencode-go.sh` collector reads the undocumented account-level usage endpoint

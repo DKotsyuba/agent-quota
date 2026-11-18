@@ -68,22 +68,42 @@ run_as() {
     /usr/sbin/runuser -u "$selected_user" -- /usr/bin/env -i "$@"
 }
 
+# Echo only an allowlisted fixed probe failure code; any other diagnostic stays private.
+probe_code() {
+    local line
+    line=$(/usr/bin/head -c 128 -- "$1" 2>/dev/null | /usr/bin/head -n 1) || return 0
+    case $line in
+        'quota probe: credential_unavailable' | 'quota probe: credential_expired' | \
+        'quota probe: credential_refresh_failed' | 'quota probe: credential_refresh_limited' | \
+        'quota probe: external_probe_failed' | \
+        'quota probe: external_config_invalid' | 'quota probe: external_source_unavailable' | \
+        'quota probe: collector_output_invalid' | 'quota probe: collector_output_empty' | \
+        'quota probe: collector_output_contains_credential')
+            printf '%s' "${line#quota probe: }" ;;
+    esac
+}
+
 # Capture a complete probe before submitting it; no credential or envelope is logged.
+# The probe's diagnostic goes to a root-private file in the lock directory, never to logs.
 collect() {
-    local observation
+    local observation code diagnostic="$lock_directory/probe-diagnostic"
     if ! observation=$(
         {
             run_as "$AQ_PROBE_USER" \
                 HOME="$AQ_PROBE_OS_HOME" USER="$AQ_PROBE_USER" LOGNAME="$AQ_PROBE_USER" \
                 PATH="$AQ_PROBE_PATH" TMPDIR="$AQ_PROBE_TMP" TMP="$AQ_PROBE_TMP" TEMP="$AQ_PROBE_TMP" \
                 "$AQ_BINARY" probe --home "$AQ_PROBE_PRIVATE_HOME" --config "$AQ_CONFIG" \
-                --account "$AQ_ACCOUNT" --provider "$AQ_PROVIDER" --source "$AQ_SOURCE" 9<&- |
+                --account "$AQ_ACCOUNT" --provider "$AQ_PROVIDER" --source "$AQ_SOURCE" \
+                9<&- 2>"$diagnostic" |
                 /usr/bin/head -c "$((max_observation + 1))" 9<&-
         } 2>/dev/null
     ) || (( ${#observation} > max_observation )); then
-        printf '%s\n' 'quota owner collection: probe failed' >&2
+        code=$(probe_code "$diagnostic")
+        /usr/bin/rm -f -- "$diagnostic"
+        printf '%s\n' "quota owner collection: probe failed${code:+: $code}" >&2
         return 1
     fi
+    /usr/bin/rm -f -- "$diagnostic"
     if ! {
         printf '%s\n' "$observation" | run_as "$AQ_SERVICE_USER" \
             PATH=/usr/bin:/bin TMPDIR="$AQ_SERVICE_TMP" TMP="$AQ_SERVICE_TMP" TEMP="$AQ_SERVICE_TMP" \

@@ -99,7 +99,7 @@ impl CollectorBinding {
 const MAX_BYTES: usize = 2 * 1024 * 1024;
 
 /// Prepares an owner-private temporary directory inside the collector's service home.
-fn temp_dir(home: &Path) -> Result<PathBuf, String> {
+pub(crate) fn temp_dir(home: &Path) -> Result<PathBuf, String> {
     let path = home.join("tmp");
     match std::fs::DirBuilder::new().mode(0o700).create(&path) {
         Ok(()) => {}
@@ -146,6 +146,79 @@ impl Drop for ProcessGuard {
     }
 }
 
+/// Builds a child environment from basic host names plus explicitly granted names,
+/// with `TMPDIR`, `TMP` and `TEMP` pointing at the private temporary directory in `home`.
+pub(crate) fn restricted_environment(
+    env_from: &[String],
+    home: &Path,
+) -> Result<BTreeMap<String, String>, String> {
+    let mut environment: BTreeMap<String, String> =
+        ["HOME", "PATH", "USER", "LOGNAME", "LANG", "LC_ALL"]
+            .into_iter()
+            .chain(env_from.iter().map(String::as_str))
+            .filter_map(|name| {
+                std::env::var(name)
+                    .ok()
+                    .map(|value| (name.to_owned(), value))
+            })
+            .collect();
+    environment
+        .entry("PATH".into())
+        .or_insert_with(|| "/usr/bin:/bin:/usr/sbin:/sbin".into());
+    let temp = temp_dir(home)?;
+    let temp = temp.to_str().ok_or("collector_temp_unavailable")?;
+    for key in ["TMPDIR", "TMP", "TEMP"] {
+        environment.insert(key.to_owned(), temp.to_owned());
+    }
+    Ok(environment)
+}
+
+/// Runs a prepared argument-only helper with null stdio in its own process group.
+///
+/// Nothing the helper prints is read, so its output cannot reach diagnostics. The deadline
+/// covers the whole run; the leader and its observed descendants are then cleaned up even
+/// after a normal exit. Returns the exit status, or a fixed code on spawn, timeout or
+/// unconfirmed cleanup.
+pub(crate) async fn run_silent(
+    mut command: tokio::process::Command,
+    timeout: Duration,
+) -> Result<std::process::ExitStatus, &'static str> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    use std::os::unix::process::CommandExt;
+    command.as_std_mut().process_group(0);
+    let mut child = command.spawn().map_err(|_| "helper_spawn_failed")?;
+    let pid = child
+        .id()
+        .and_then(|pid| i32::try_from(pid).ok())
+        .ok_or("helper_process_identity_unavailable")?;
+    let mut guard = ProcessGuard {
+        owner: OwnedProcess::capture(pid),
+        armed: true,
+    };
+    let deadline = tokio::time::sleep(timeout);
+    tokio::pin!(deadline);
+    let mut tick = tokio::time::interval(Duration::from_millis(25));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let status = loop {
+        tokio::select! {
+            result = child.wait() => break result.map_err(|_| "helper_wait_failed"),
+            _ = &mut deadline => break Err("helper_timeout"),
+            _ = tick.tick() => guard.owner.refresh(),
+        }
+    };
+    let cleanup = guard.owner.cleanup(Duration::from_millis(250)).await;
+    guard.armed = false;
+    let reaped = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+    if !cleanup.is_ok_and(|proof| proof.confirmed) || !matches!(reaped, Ok(Ok(_))) {
+        return Err("helper_cleanup_unverified");
+    }
+    status
+}
+
 /// Executes exactly the configured command/args with private JSON stdin and bounded streams.
 ///
 /// The context may contain credentials and is never persisted or put in argv. The
@@ -170,24 +243,7 @@ pub(crate) async fn run(
         return Err("collector_input_too_large".into());
     }
     let deadline_at = tokio::time::Instant::now() + Duration::from_secs(binding.timeout_seconds);
-    let mut environment: BTreeMap<String, String> =
-        ["HOME", "PATH", "USER", "LOGNAME", "LANG", "LC_ALL"]
-            .into_iter()
-            .chain(binding.env_from.iter().map(String::as_str))
-            .filter_map(|name| {
-                std::env::var(name)
-                    .ok()
-                    .map(|value| (name.to_owned(), value))
-            })
-            .collect();
-    environment
-        .entry("PATH".into())
-        .or_insert_with(|| "/usr/bin:/bin:/usr/sbin:/sbin".into());
-    let temp = temp_dir(cwd)?;
-    let temp = temp.to_str().ok_or("collector_temp_unavailable")?;
-    for key in ["TMPDIR", "TMP", "TEMP"] {
-        environment.insert(key.to_owned(), temp.to_owned());
-    }
+    let environment = restricted_environment(&binding.env_from, cwd)?;
     let mut command = tokio::process::Command::new(&binding.command);
     command
         .args(&binding.args)
