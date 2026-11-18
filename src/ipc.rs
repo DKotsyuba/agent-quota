@@ -127,6 +127,15 @@ fn validate_request(request: &Request) -> Result<(), &'static str> {
         {
             Ok(())
         }
+        "capacity"
+            if request.accounts.is_empty()
+                && request.observation.is_none()
+                && request.model.as_ref().is_none_or(|model| {
+                    !model.is_empty() && model.len() <= 256 && !model.chars().any(char::is_control)
+                }) =>
+        {
+            Ok(())
+        }
         "ingest"
             if request.accounts.is_empty()
                 && request.model.is_none()
@@ -134,7 +143,7 @@ fn validate_request(request: &Request) -> Result<(), &'static str> {
         {
             Ok(())
         }
-        "status" | "snapshot" | "ingest" => Err("invalid_request"),
+        "status" | "snapshot" | "capacity" | "ingest" => Err("invalid_request"),
         _ => Err("unsupported_method"),
     }
 }
@@ -718,6 +727,7 @@ mod tests {
             ("status", vec![]),
             ("snapshot", vec!["acct-a".into()]),
             ("snapshot", vec![]),
+            ("capacity", vec![]),
         ] {
             let reply = request(
                 &path,
@@ -839,6 +849,18 @@ mod tests {
             ),
             (
                 b"{\"version\":1,\"method\":\"status\",\"secret\":\"private\"}\n",
+                "invalid_request",
+            ),
+            (
+                b"{\"version\":1,\"method\":\"capacity\",\"accounts\":[\"a\"]}\n",
+                "invalid_request",
+            ),
+            (
+                b"{\"version\":1,\"method\":\"capacity\",\"model\":\"\"}\n",
+                "invalid_request",
+            ),
+            (
+                b"{\"version\":1,\"method\":\"capacity\",\"observation\":{}}\n",
                 "invalid_request",
             ),
         ] {

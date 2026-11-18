@@ -28,6 +28,40 @@ shell unless an interpreter is explicitly configured. The timeout defaults to
 the restricted child environment; private `TMPDIR`, `TMP` and `TEMP` are supplied
 inside the service or worker home.
 
+## Capacity ranking
+
+The [capacity order](api.md#capacity-order) uses two optional weights migrated
+from agent-run's provider configuration. Both must be positive finite numbers
+and default to `1.0`; existing files need no change.
+
+```toml
+[[sources]]
+account = "acct-personal"
+provider = "codex-plus"
+priority_multiplier = 2.0   # account weight for this provider binding
+# ...
+
+[providers.codex-plus]      # must name a configured source provider
+priority_multiplier = 5.0   # provider weight
+ordered_accounts = false    # true: account weights are a fallback order, ranked neutrally
+```
+
+Mapping from an agent-run schema-2 provider configuration:
+
+| agent-run | agent-quota |
+|---|---|
+| `[providers.P] priority_multiplier` | `[providers.P] priority_multiplier` |
+| `[providers.P] ordered_accounts` | `[providers.P] ordered_accounts` |
+| `[[providers.P.models]] id/native_model` | `models = [{ id, native_model }]` of each source with `provider = "P"` |
+| `[[providers.P.bindings]] account, priority_multiplier` | `account`, `priority_multiplier` of a source with `provider = "P"` |
+| binding `models = [...]` subset | that source's own `models` list |
+
+Every agent-run provider that should appear in the order needs at least one
+source; one without a collector uses `limits_source = "none"` and stays
+`unknown`. Changing a weight changes the configuration revision, so coverage is
+`partial` until the next completed collection round under that revision. The
+weights affect only the capacity order; collection and `get_quota` are unchanged.
+
 ## Credential references
 
 Never put a token value in TOML, command arguments, diagnostics, or logs.
