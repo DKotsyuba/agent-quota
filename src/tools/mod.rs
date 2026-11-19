@@ -15,7 +15,7 @@ pub fn definitions() -> Vec<Value> {
         json!({"name":"get_quota", "description":"Read stored quota metrics from the local service. Does not contact providers or start models. Narrow account or model scope if the result is too large.",
         "inputSchema":{"type":"object","properties":{"accounts":{"type":"array","items":{"type":"string"},"maxItems":256},"model":{"type":["string","null"],"maxLength":256}},"additionalProperties":false},
         "annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}}),
-        json!({"name":"get_capacity", "description":"Rank configured providers and their models by stored quota capacity (highest first), applying Quota's provider and account multipliers. Shows each model's status (available, limited, unknown, exhausted), remaining percentage, limiting window, reset and evidence freshness. Account-free: no account or pool identities. Read-only; does not contact providers or start models.",
+        json!({"name":"get_capacity", "description":"Rank configured providers and their models by stored quota capacity (highest first), applying Quota's provider and account multipliers. Shows each model's status (available, limited, unknown, priority_overflow, exhausted), remaining percentage, limiting window, reset and evidence freshness. Account-free: no account or pool identities. Read-only; does not contact providers or start models.",
         "inputSchema":{"type":"object","properties":{"model":{"type":["string","null"],"maxLength":256}},"additionalProperties":false},
         "annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}}),
         // xtask:definitions
@@ -374,7 +374,13 @@ fn capacity_view(value: Value) -> Result<CapacityPage, &'static str> {
     {
         return Err("invalid_service_response");
     }
-    let statuses = ["available", "limited", "unknown", "exhausted"];
+    let statuses = [
+        "available",
+        "limited",
+        "unknown",
+        "priority_overflow",
+        "exhausted",
+    ];
     let mut rows = 0usize;
     let mut providers = Vec::with_capacity(capacity.providers.len());
     for (index, provider) in capacity.providers.into_iter().enumerate() {
@@ -538,8 +544,14 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains('\u{202e}'));
+        let mut overflow = capacity.clone();
+        overflow["providers"][0]["status"] = json!("priority_overflow");
+        overflow["providers"][0]["models"][0]["status"] = json!("priority_overflow");
+        let page = capacity_view(overflow).unwrap();
+        let text = templates.render("capacity", &page).unwrap();
+        assert_eq!(text.matches("priority_overflow").count(), 2);
         let mut invalid = capacity.clone();
-        invalid["providers"][0]["models"][0]["status"] = json!("priority_overflow");
+        invalid["providers"][0]["models"][0]["status"] = json!("unsupported");
         assert!(matches!(
             capacity_view(invalid),
             Err("invalid_service_response")

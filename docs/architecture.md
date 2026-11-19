@@ -28,6 +28,9 @@ same source line, not the exact release bytes. Other hosts remain unqualified.
 
 Forecasts and advisory recommendations retain the agent-run calculation rules.
 Unknown, expired, failed, and exhausted observations remain distinguishable.
+The account-free capacity order uses Agent Run's score and tie rules. A scored
+model row publishes its native lane and window details from the account and lane
+that supplied its best priority. See the [capacity API](api.md#capacity-order).
 A service result is a timed observation, not a reservation or an atomic promise
 about a later agent-run launch. The owner chose unknown fallback when this
 service is unavailable; native quota refusals are not sent back to this service.

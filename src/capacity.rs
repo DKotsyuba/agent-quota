@@ -9,6 +9,7 @@
 use crate::config::{ProviderRanking, QuotaConfig};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Capacity result schema; independent of the snapshot schema it is derived from.
@@ -94,8 +95,10 @@ struct WindowForecast {
 enum Verdict<'a> {
     /// Usable capacity with `quota_score * account multiplier`.
     Known { priority: f64, model: &'a Model },
-    /// No current evidence, or a non-finite weighted priority; never zero.
+    /// No current evidence.
     Unknown,
+    /// Current evidence whose weighted priority exceeds the finite range.
+    Overflow,
     /// Fresh zero or active latch.
     Exhausted { model: &'a Model },
 }
@@ -116,7 +119,7 @@ pub(crate) struct CapacityView {
 struct CoverageView {
     /// Quota collection coverage: `complete`, `partial` or `unknown`.
     state: String,
-    /// True when coverage is not complete or any eligible account is unknown.
+    /// True when coverage is not complete or an eligible lane is unknown or overflows.
     incomplete: bool,
 }
 /// One provider's account-free standing.
@@ -135,7 +138,7 @@ struct ProviderView {
 struct ModelView {
     model: String,
     native_model: String,
-    /// `available`, `limited`, `unknown` or `exhausted`.
+    /// `available`, `limited`, `unknown`, `priority_overflow` or `exhausted`.
     status: &'static str,
     /// Best weighted account priority; null without known capacity.
     best_priority: Option<f64>,
@@ -165,13 +168,14 @@ struct WindowView {
     valid_until: Option<f64>,
 }
 
-/// Status order used for provider tie-breaking: lower is better.
+/// Agent Run's status order for score ties. Both known display statuses share a rank.
 fn status_rank(status: &str) -> u8 {
     match status {
-        "available" => 0,
-        "limited" => 1,
-        "unknown" => 2,
-        _ => 3,
+        "available" | "limited" => 0,
+        "unknown" => 1,
+        "priority_overflow" => 2,
+        "exhausted" => 3,
+        _ => 4,
     }
 }
 
@@ -213,7 +217,7 @@ fn verdict(
     Ok(if priority.is_finite() {
         Verdict::Known { priority, model }
     } else {
-        Verdict::Unknown
+        Verdict::Overflow
     })
 }
 
@@ -263,7 +267,8 @@ fn min_option(values: impl Iterator<Item = f64>) -> Option<f64> {
 /// narrowed to one model, evaluated with `config`. A provider offers the models
 /// of its sources in declaration order; a source's account is eligible for its
 /// own models with the source's `priority_multiplier`. Providers with no model
-/// in scope are omitted. Errors are fixed safe codes.
+/// in scope are omitted. A scored row takes its native model and detail fields
+/// from the lane and account that supplied its best priority. Errors are fixed safe codes.
 pub(crate) fn rank(
     config: &QuotaConfig,
     snapshot: Value,
@@ -333,6 +338,7 @@ pub(crate) fn rank(
             let mut known: Vec<(f64, &Model, &Account)> = Vec::new();
             let mut exhausted: Vec<(&Model, &Account)> = Vec::new();
             let mut unknown = false;
+            let mut overflow = false;
             let mut newest: Option<f64> = None;
             let mut native_model: Option<&str> = None;
             for ((account_id, native), factor) in &eligible {
@@ -358,6 +364,7 @@ pub(crate) fn rank(
                     Verdict::Known { priority, model } => known.push((priority, model, account)),
                     Verdict::Exhausted { model } => exhausted.push((model, account)),
                     Verdict::Unknown => unknown = true,
+                    Verdict::Overflow => overflow = true,
                 }
             }
             let Some(native_model) = native_model else {
@@ -386,24 +393,24 @@ pub(crate) fn rank(
                 }
             } else if unknown {
                 "unknown"
+            } else if overflow {
+                "priority_overflow"
             } else {
                 "exhausted"
             };
-            incomplete |= unknown;
+            incomplete |= unknown || overflow;
             let best_priority = known.first().map(|(priority, _, _)| *priority);
             if let Some(priority) = best_priority {
                 best = Some(best.map_or(priority, |current: f64| current.max(priority)));
             }
             let representative = match status {
-                "available" => known
-                    .iter()
-                    .find(|(_, model, _)| model.risk != "high")
-                    .map(|(_, model, account)| (*model, *account)),
-                "limited" => known.first().map(|(_, model, account)| (*model, *account)),
+                "available" | "limited" => {
+                    known.first().map(|(_, model, account)| (*model, *account))
+                }
                 "exhausted" => exhausted.first().copied(),
                 _ => None,
             };
-            let evidence = if status != "unknown" {
+            let evidence = if best_priority.is_some() || status == "exhausted" {
                 "fresh"
             } else if newest.is_some() {
                 "stale"
@@ -457,7 +464,7 @@ pub(crate) fn rank(
         let status = models
             .iter()
             .map(|model| model.status)
-            .min_by_key(|status| status_rank(status))
+            .min_by_key(|status| (status_rank(status), *status == "limited"))
             .unwrap_or("unknown");
         providers.push(ProviderView {
             provider: provider.to_owned(),
@@ -468,9 +475,11 @@ pub(crate) fn rank(
         });
     }
     providers.sort_by(|a, b| {
-        b.score
-            .unwrap_or(f64::NEG_INFINITY)
-            .total_cmp(&a.score.unwrap_or(f64::NEG_INFINITY))
+        let a_score = a.score.unwrap_or(f64::NEG_INFINITY);
+        let b_score = b.score.unwrap_or(f64::NEG_INFINITY);
+        b_score
+            .partial_cmp(&a_score)
+            .unwrap_or(Ordering::Equal)
             .then_with(|| status_rank(a.status).cmp(&status_rank(b.status)))
             .then_with(|| a.provider.cmp(&b.provider))
     });
@@ -538,7 +547,7 @@ pub(crate) fn hook_text(capacity: Value, limit: usize) -> String {
             provider.models.iter().any(|model| {
                 !matches!(
                     model.status.as_str(),
-                    "available" | "limited" | "unknown" | "exhausted"
+                    "available" | "limited" | "unknown" | "priority_overflow" | "exhausted"
                 )
             })
         })
@@ -719,6 +728,127 @@ mod tests {
         );
     }
 
+    /// Agent Run breaks equal known scores by provider name regardless of quota risk.
+    #[test]
+    fn equal_provider_scores_sort_by_name() {
+        let config = QuotaConfig::parse(
+            &[
+                source("a2", "beta", &["m1"], None),
+                source("a1", "alpha", &["m1"], None),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        let view = rank(
+            &config,
+            snapshot(
+                "complete",
+                vec![
+                    account("a2", vec![model("beta", "m1", "known", Some(1.0), "low")]),
+                    account("a1", vec![model("alpha", "m1", "known", Some(1.0), "high")]),
+                ],
+            ),
+            1000.0,
+        )
+        .unwrap();
+        assert_eq!(view.providers[0].provider, "alpha");
+        assert_eq!(view.providers[0].status, "limited");
+        assert_eq!(view.providers[1].provider, "beta");
+        assert_eq!(view.providers[1].status, "available");
+        assert_eq!(view.providers[0].score, view.providers[1].score);
+    }
+
+    /// Agent Run ranks unknown above overflow and overflow above exhausted.
+    #[test]
+    fn overflow_is_distinct_from_unknown_and_exhausted() {
+        let config = QuotaConfig::parse(
+            &[
+                source("a1", "alpha", &["m1"], None),
+                source("a2", "beta", &["m1"], Some(2.0)),
+                source("a3", "gamma", &["m1"], None),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        let view = rank(
+            &config,
+            snapshot(
+                "complete",
+                vec![
+                    account("a1", vec![model("alpha", "m1", "exhausted", None, "high")]),
+                    account(
+                        "a2",
+                        vec![model("beta", "m1", "known", Some(f64::MAX), "low")],
+                    ),
+                    account("a3", vec![model("gamma", "m1", "unknown", None, "unknown")]),
+                ],
+            ),
+            1000.0,
+        )
+        .unwrap();
+        let statuses: Vec<_> = view
+            .providers
+            .iter()
+            .map(|provider| provider.status)
+            .collect();
+        assert_eq!(statuses, ["unknown", "priority_overflow", "exhausted"]);
+        let overflow = &view.providers[1];
+        assert_eq!(overflow.score, None);
+        assert_eq!(overflow.models[0].status, "priority_overflow");
+        assert_eq!(overflow.models[0].best_priority, None);
+        assert_eq!(overflow.models[0].evidence, "stale");
+        assert!(view.coverage.incomplete);
+        assert!(
+            hook_text(serde_json::to_value(view).unwrap(), HOOK_DEFAULT_CHARS)
+                .contains("\"m1\":priority_overflow")
+        );
+    }
+
+    /// A shared alias publishes model and window details from the account and lane that scored.
+    #[test]
+    fn alias_details_follow_the_scoring_lane() {
+        let config = QuotaConfig::parse(
+            &[
+                source("a1", "alpha", &["m1"], None),
+                source("a2", "alpha", &["m1"], Some(3.0))
+                    .replace(r#"id = "m1""#, r#"id = "m1", native_model = "native""#),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        let mut scoring_model = model("alpha", "m1", "known", Some(0.5), "high");
+        scoring_model["native_model"] = json!("native");
+        scoring_model["limiting_window"]["window"] = json!("weekly");
+        scoring_model["remaining_percent"] = json!(5.0);
+        let mut scoring_account = account("a2", vec![scoring_model]);
+        let window = &mut scoring_account["windows"][0];
+        window["models"] = json!(["native"]);
+        window["window"] = json!("weekly");
+        window["forecast"]["remaining_percent"] = json!(5.0);
+        let view = rank(
+            &config,
+            snapshot(
+                "complete",
+                vec![
+                    account("a1", vec![model("alpha", "m1", "known", Some(1.0), "low")]),
+                    scoring_account,
+                ],
+            ),
+            1000.0,
+        )
+        .unwrap();
+        let row = &view.providers[0].models[0];
+        assert_eq!(row.status, "available");
+        assert_eq!(row.best_priority, Some(1.5));
+        assert_eq!(row.native_model, "native");
+        assert_eq!(row.risk, "high");
+        assert_eq!(row.limiting_window.as_deref(), Some("weekly"));
+        assert_eq!(row.remaining_percent, Some(5.0));
+        assert_eq!(row.windows.len(), 1);
+        assert_eq!(row.windows[0].window, "weekly");
+        assert_eq!(row.windows[0].remaining_percent, Some(5.0));
+    }
+
     /// Limited, unknown and exhausted states keep their distinct meanings and order.
     #[test]
     fn statuses_distinguish_limited_unknown_and_exhausted() {
@@ -834,7 +964,7 @@ mod tests {
                 .ends_with("Quota coverage: partial.")
         );
         let mut invalid = capacity;
-        invalid["providers"][0]["models"][0]["status"] = json!("priority_overflow");
+        invalid["providers"][0]["models"][0]["status"] = json!("unsupported");
         assert!(hook_text(invalid, HOOK_DEFAULT_CHARS).is_empty());
     }
 }
