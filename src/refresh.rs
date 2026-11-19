@@ -4,6 +4,7 @@ mod ledger;
 mod profile;
 
 use crate::{
+    collector::{self, HelperError},
     config::SourceConfig,
     credentials::{
         CREDENTIAL_EXPIRED, CREDENTIAL_REFRESH_CLEANUP_UNCONFIRMED, CREDENTIAL_REFRESH_FAILED,
@@ -64,6 +65,9 @@ async fn renew(
     if !source.harness.refresh_oauth {
         return Ok(Renewal::NotConfigured);
     }
+    if host.unsupported {
+        return Err(CREDENTIAL_REFRESH_UNSUPPORTED_HOST);
+    }
     let login = source
         .credential
         .claude_login(
@@ -72,6 +76,7 @@ async fn renew(
             source.native_directory.as_deref(),
         )?
         .ok_or(CREDENTIAL_UNAVAILABLE)?;
+    host.check_store_path(&login.directory)?;
     let store = Store::open(&login.directory).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             CREDENTIAL_UNAVAILABLE
@@ -111,29 +116,36 @@ async fn renew(
     }
 
     let cli = host.prepare(source, &login, &store, home)?;
-    if !ledger.admit(home, at)? {
+    if !ledger.available(home, at)? {
         return after_attempt(&login, at, CREDENTIAL_REFRESH_LIMITED);
     }
-    // Persist the fence before spawn. Cancellation or a crash leaves it set even after flock
-    // is released. Never clear it when process cleanup could not be confirmed.
+    // Fence qualification before spawn. Only a print turn consumes the rolling allowance.
+    ledger.pending = true;
     ledger.save(&store)?;
-    if let Err(code) = cli.qualify().await {
-        if code != CREDENTIAL_REFRESH_CLEANUP_UNCONFIRMED {
-            ledger.attempts.pop();
-            ledger.complete(&store)?;
+    let result = async {
+        cli.qualify().await?;
+        let command = cli.print_command(&store)?;
+        let started_at = now()?;
+        if !ledger.available(home, started_at)? {
+            return after_attempt(&login, started_at, CREDENTIAL_REFRESH_LIMITED);
         }
-        return Err(code);
+        ledger.charge(started_at);
+        ledger.save(&store)?;
+        if collector::run_helper(command, timeout, None).await
+            == Err(HelperError::CleanupUnconfirmed)
+        {
+            return Err(CREDENTIAL_REFRESH_CLEANUP_UNCONFIRMED);
+        }
+        store
+            .verify_path(&login.directory)
+            .map_err(|_| CREDENTIAL_REFRESH_UNSUPPORTED_HOST)?;
+        after_attempt(&login, now()?, CREDENTIAL_REFRESH_FAILED)
     }
-    let result = cli.run(&store, timeout).await;
-    if result == Err(CREDENTIAL_REFRESH_CLEANUP_UNCONFIRMED) {
-        return Err(CREDENTIAL_REFRESH_CLEANUP_UNCONFIRMED);
+    .await;
+    if result != Err(CREDENTIAL_REFRESH_CLEANUP_UNCONFIRMED) {
+        ledger.complete(&store)?;
     }
-    ledger.complete(&store)?;
-    result?;
-    store
-        .verify_path(&login.directory)
-        .map_err(|_| CREDENTIAL_REFRESH_UNSUPPORTED_HOST)?;
-    after_attempt(&login, now()?, CREDENTIAL_REFRESH_FAILED)
+    result
 }
 
 /// Determines the result using the current expiry and a fresh clock reading supplied by the caller.

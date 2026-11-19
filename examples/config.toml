@@ -39,7 +39,7 @@ timeout_seconds = 30
 # source = "opencode-go-usage"
 # timeout_seconds = 30
 
-# Claude subscription login. refresh_oauth lets the configured Claude CLI renew the
+# Claude subscription login. On native Linux, refresh_oauth lets the pinned Claude CLI renew the
 # OAuth login (one isolated tiny haiku turn, at most six per day) when it is within
 # five minutes of expiry and a collection is due; omit it to only report
 # credential_expired.

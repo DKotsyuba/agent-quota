@@ -117,9 +117,8 @@ source = "claude-usage"
         let host = Host {
             home: root.join("os-home"),
             managed: root.join("managed"),
-            preferences: Some(root.join("managed-preferences")),
+            ancestry_root: root.clone(),
             unsupported: false,
-            keychain_only: false,
         };
         Self {
             _directory: directory,
@@ -337,21 +336,6 @@ async fn managed_hooks_mcp_and_remote_policy_refuse_launch() {
     );
     std::fs::remove_dir(drop_ins).unwrap();
 
-    let preferences = fixture
-        .host
-        .preferences
-        .as_ref()
-        .unwrap()
-        .join("synthetic-user");
-    std::fs::create_dir_all(&preferences).unwrap();
-    let plist = preferences.join("com.anthropic.claudecode.plist");
-    std::fs::write(&plist, b"").unwrap();
-    assert_eq!(
-        fixture.renew().await,
-        Err(CREDENTIAL_REFRESH_UNSUPPORTED_HOST)
-    );
-    std::fs::remove_file(plist).unwrap();
-
     let cached = fixture.login.join("remote-settings.json");
     std::os::unix::fs::symlink(fixture.root.join("missing"), &cached).unwrap();
     assert_eq!(
@@ -387,15 +371,91 @@ async fn managed_hooks_mcp_and_remote_policy_refuse_launch() {
 }
 
 #[tokio::test]
-async fn macos_profile_refuses_ambiguous_file_and_keychain_authentication() {
+async fn unsupported_platform_refuses_before_accessing_the_store() {
     let mut fixture = Fixture::new(true);
-    fixture.store(-1, true);
-    fixture.host.keychain_only = true;
+    fixture.host.unsupported = true;
     assert_eq!(
         fixture.renew().await,
         Err(CREDENTIAL_REFRESH_UNSUPPORTED_HOST)
     );
     assert!(!fixture.root.join("version-calls").exists());
+}
+
+#[tokio::test]
+async fn store_paths_with_symlinks_or_writable_ancestors_cannot_launch() {
+    let fixture = Fixture::new(true);
+    fixture.store(-1, true);
+    let alias = fixture.root.join("alias");
+    std::os::unix::fs::symlink(&fixture.login, &alias).unwrap();
+    let mut source = fixture.source.clone();
+    source.native_directory = Some(alias);
+    assert_eq!(
+        renew(
+            &source,
+            &fixture.home,
+            AT,
+            &fixture.host,
+            RENEWAL_TIMEOUT,
+            || Ok(AT)
+        )
+        .await,
+        Err(CREDENTIAL_REFRESH_UNSUPPORTED_HOST)
+    );
+
+    let shared = fixture.root.join("shared");
+    std::fs::create_dir(&shared).unwrap();
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o770)).unwrap();
+    let nested = shared.join("login");
+    std::fs::rename(&fixture.login, &nested).unwrap();
+    source.native_directory = Some(nested);
+    assert_eq!(
+        renew(
+            &source,
+            &fixture.home,
+            AT,
+            &fixture.host,
+            RENEWAL_TIMEOUT,
+            || Ok(AT)
+        )
+        .await,
+        Err(CREDENTIAL_REFRESH_UNSUPPORTED_HOST)
+    );
+    assert!(!fixture.root.join("version-calls").exists());
+}
+
+#[tokio::test]
+async fn qualification_is_fenced_and_print_turn_uses_its_later_timestamp() {
+    let fixture = Fixture::new(true);
+    fixture.store(120, true);
+    let store = Store::open(&fixture.login).unwrap();
+    let observed = std::cell::Cell::new(false);
+    let now = || {
+        if !fixture.root.join("version-calls").exists() {
+            return Ok(AT);
+        }
+        if !observed.replace(true) {
+            let ledger = Ledger::load(&store).unwrap();
+            assert!(ledger.pending);
+            assert!(ledger.attempts.is_empty());
+        }
+        Ok(AT + 30.0)
+    };
+    assert_eq!(
+        renew(
+            &fixture.source,
+            &fixture.home,
+            AT,
+            &fixture.host,
+            RENEWAL_TIMEOUT,
+            now
+        )
+        .await,
+        Ok(Renewal::StillValid)
+    );
+    assert!(observed.get());
+    let ledger = Ledger::load(&store).unwrap();
+    assert_eq!(ledger.attempts, [AT + 30.0]);
+    assert!(!ledger.pending);
 }
 
 #[tokio::test]
@@ -484,15 +544,11 @@ async fn attempts_are_capped_per_login_per_trailing_day() {
     assert_eq!(fixture.calls().len(), MAX_RENEWALS_PER_DAY);
     // Once expired, the cap is reported distinctly and the CLI is not started.
     fixture.store(-1, true);
-    let alias = fixture.root.join("alias");
-    std::os::unix::fs::symlink(&fixture.login, &alias).unwrap();
     let alternate_home = fixture.root.join("alternate-quota-home");
     std::fs::create_dir(&alternate_home).unwrap();
-    let mut source = fixture.source.clone();
-    source.native_directory = Some(alias);
     assert_eq!(
         renew(
-            &source,
+            &fixture.source,
             &alternate_home,
             AT,
             &fixture.host,
@@ -539,7 +595,8 @@ fn ledger_replace_stays_with_the_open_store_after_path_replacement() {
     std::fs::create_dir(&fixture.login).unwrap();
     assert!(store.verify_path(&fixture.login).is_err());
     let mut ledger = Ledger::load(&store).unwrap();
-    assert!(ledger.admit(&fixture.home, AT).unwrap());
+    ledger.pending = true;
+    ledger.charge(AT);
     ledger.save(&store).unwrap();
     assert!(!fixture.ledger_path().exists());
     assert!(moved.join(LEDGER.to_str().unwrap()).exists());

@@ -12,7 +12,7 @@ use std::{
     fs,
     io::ErrorKind,
     os::unix::fs::MetadataExt,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     time::Duration,
 };
 use tokio::process::Command;
@@ -25,11 +25,7 @@ const SETTINGS: &str = r#"{"disableAllHooks":true,"disableClaudeAiConnectors":tr
 const EMPTY_MCP: &str = r#"{"mcpServers":{}}"#;
 const PROMPT: &str = "Reply with OK.";
 
-#[cfg(target_os = "linux")]
 const MANAGED_ROOT: &str = "/etc/claude-code";
-#[cfg(target_os = "macos")]
-const MANAGED_ROOT: &str = "/Library/Application Support/ClaudeCode";
-const MANAGED_DOMAIN: &str = "com.anthropic.claudecode.plist";
 
 /// Fixed print-mode flags. Managed policy must already be excluded by the host check.
 pub(super) fn cli_arguments() -> [&'static str; 18] {
@@ -59,9 +55,8 @@ pub(super) fn cli_arguments() -> [&'static str; 18] {
 pub(super) struct Host {
     pub(super) home: PathBuf,
     pub(super) managed: PathBuf,
-    pub(super) preferences: Option<PathBuf>,
+    pub(super) ancestry_root: PathBuf,
     pub(super) unsupported: bool,
-    pub(super) keychain_only: bool,
 }
 
 impl Host {
@@ -73,15 +68,14 @@ impl Host {
                 release.to_ascii_lowercase().contains("microsoft")
             });
         #[cfg(target_os = "macos")]
-        let unsupported = false;
+        let unsupported = true;
         Self {
             home: std::env::var_os("HOME")
                 .map(PathBuf::from)
                 .unwrap_or_default(),
             managed: PathBuf::from(MANAGED_ROOT),
-            preferences: cfg!(target_os = "macos").then(|| "/Library/Managed Preferences".into()),
+            ancestry_root: PathBuf::from("/"),
             unsupported,
-            keychain_only: cfg!(target_os = "macos"),
         }
     }
 
@@ -90,17 +84,12 @@ impl Host {
         if self.unsupported || !self.home.is_absolute() {
             return Err(CREDENTIAL_REFRESH_UNSUPPORTED_HOST);
         }
-        // An active Anthropic profile can take precedence over the subscription or
-        // serve as a fallback when it expires. The macOS profile uses Keychain only
-        // so a leftover plaintext document cannot identify a different account.
+        self.check_store_path(&login.directory)?;
+        // An active Anthropic profile can take precedence over the subscription.
         require_absent(&self.home.join(".config/anthropic"))?;
-        if self.keychain_only {
-            require_absent(&login.directory.join(".credentials.json"))?;
-        } else {
-            store
-                .verify_credential_file()
-                .map_err(|_| CREDENTIAL_REFRESH_UNSUPPORTED_HOST)?;
-        }
+        store
+            .verify_credential_file()
+            .map_err(|_| CREDENTIAL_REFRESH_UNSUPPORTED_HOST)?;
         // Check both locations of Claude's cached remote settings.
         for name in [
             "managed-settings.json",
@@ -113,32 +102,14 @@ impl Host {
         for path in [&login.directory, &self.home.join(".claude")] {
             require_absent(&path.join("remote-settings.json"))?;
         }
-        if let Some(root) = &self.preferences {
-            self.check_preferences(root)?;
-        }
         store
             .verify_path(&login.directory)
             .map_err(|_| CREDENTIAL_REFRESH_UNSUPPORTED_HOST)
     }
 
-    /// Checks the macOS system and per-user managed preferences for Claude Code's domain.
-    fn check_preferences(&self, root: &Path) -> Result<(), &'static str> {
-        require_absent(&root.join(MANAGED_DOMAIN))?;
-        let entries = match fs::read_dir(root) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
-            Err(_) => return Err(CREDENTIAL_REFRESH_UNSUPPORTED_HOST),
-        };
-        for entry in entries {
-            let entry = entry.map_err(|_| CREDENTIAL_REFRESH_UNSUPPORTED_HOST)?;
-            let kind = entry
-                .file_type()
-                .map_err(|_| CREDENTIAL_REFRESH_UNSUPPORTED_HOST)?;
-            if kind.is_dir() || kind.is_symlink() {
-                require_absent(&entry.path().join(MANAGED_DOMAIN))?;
-            }
-        }
-        Ok(())
+    /// Checks every CLI-facing path component before canonicalization can hide a symlink.
+    pub(super) fn check_store_path(&self, path: &Path) -> Result<(), &'static str> {
+        trusted_ancestry(path, &self.ancestry_root).map_err(|_| CREDENTIAL_REFRESH_UNSUPPORTED_HOST)
     }
 
     /// Validates the host and prepares the command without spawning any process.
@@ -174,6 +145,34 @@ fn require_absent(path: &Path) -> Result<(), &'static str> {
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
         _ => Err(CREDENTIAL_REFRESH_UNSUPPORTED_HOST),
     }
+}
+
+/// Walks outward from the trusted root without following symlink components.
+fn trusted_ancestry(path: &Path, root: &Path) -> std::io::Result<()> {
+    let denied = ErrorKind::PermissionDenied;
+    let suffix = path.strip_prefix(root).map_err(|_| denied)?;
+    // SAFETY: geteuid has no arguments or memory effects.
+    let owner = unsafe { libc::geteuid() };
+    let check = |path: &Path| {
+        let metadata = path.symlink_metadata()?;
+        if !metadata.is_dir()
+            || (metadata.uid() != 0 && metadata.uid() != owner)
+            || metadata.mode() & 0o022 != 0
+        {
+            return Err(denied.into());
+        }
+        Ok::<(), std::io::Error>(())
+    };
+    let mut current = root.to_owned();
+    check(&current)?;
+    for component in suffix.components() {
+        let Component::Normal(name) = component else {
+            return Err(denied.into());
+        };
+        current.push(name);
+        check(&current)?;
+    }
+    Ok(())
 }
 
 /// Stable device/inode of the canonical executable used for both CLI invocations.
@@ -227,8 +226,8 @@ impl Cli<'_> {
         }
     }
 
-    /// Return cleanup uncertainty even when the CLI updated the token or exited successfully.
-    pub(super) async fn run(&self, store: &Store, timeout: Duration) -> Result<(), &'static str> {
+    /// Rechecks the trusted store and qualified executable immediately before staging the turn.
+    pub(super) fn print_command(&self, store: &Store) -> Result<Command, &'static str> {
         self.host.check(self.login, store)?;
         if executable_identity(&self.path)? != self.identity {
             return Err(CREDENTIAL_REFRESH_UNSUPPORTED_HOST);
@@ -237,15 +236,9 @@ impl Cli<'_> {
             return Err(CREDENTIAL_REFRESH_UNSUPPORTED_HOST);
         }
         let mut command = command(&self.path, &self.host.home, self.home, &self.temp);
-        command.args(cli_arguments());
-        if self.login.overridden {
-            // The exact path also selects the macOS Keychain service for explicit logins.
-            command.env("CLAUDE_CONFIG_DIR", &self.login.directory);
-        }
-        match collector::run_helper(command, timeout, None).await {
-            Err(HelperError::CleanupUnconfirmed) => Err(CREDENTIAL_REFRESH_CLEANUP_UNCONFIRMED),
-            // The credential store is the only evidence of renewal.
-            _ => Ok(()),
-        }
+        command
+            .args(cli_arguments())
+            .env("CLAUDE_CONFIG_DIR", store.path());
+        Ok(command)
     }
 }

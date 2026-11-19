@@ -33,6 +33,11 @@ pub(super) struct Store {
 }
 
 impl Store {
+    /// Canonical path of the open store, after the caller checks its trusted ancestry.
+    pub(super) fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// Opens the canonical directory and rejects a foreign or writable-by-others store.
     pub(super) fn open(path: &Path) -> io::Result<Self> {
         let path = path.canonicalize()?;
@@ -189,23 +194,28 @@ impl Ledger {
         Ok(())
     }
 
-    /// Reserves an attempt. Count recent legacy entries conservatively because version 1 used
+    /// Checks the cap without charging a turn. Count recent legacy entries because version 1 used
     /// raw path hashes and could represent this store under any number of aliases.
-    pub(super) fn admit(&mut self, home: &Path, at: f64) -> Result<bool, &'static str> {
+    pub(super) fn available(&self, home: &Path, at: f64) -> Result<bool, &'static str> {
         if !at.is_finite() || at < 0.0 {
             return Err(CREDENTIAL_REFRESH_LIMITED);
         }
-        self.attempts.retain(|time| *time > at - DAY_SECONDS);
+        let recent = self
+            .attempts
+            .iter()
+            .filter(|time| **time > at - DAY_SECONDS)
+            .count();
         let legacy_count = legacy_attempts(home, at).map_err(|_| CREDENTIAL_REFRESH_LIMITED)?;
-        if self.attempts.len() + legacy_count >= MAX_RENEWALS_PER_DAY {
-            return Ok(false);
-        }
-        self.attempts.push(at);
-        self.pending = true;
-        Ok(true)
+        Ok(recent + legacy_count < MAX_RENEWALS_PER_DAY)
     }
 
-    /// Commits the pending fence and timestamp before CLI spawn.
+    /// Charges an admitted print turn using its own start time.
+    pub(super) fn charge(&mut self, at: f64) {
+        self.attempts.retain(|time| *time > at - DAY_SECONDS);
+        self.attempts.push(at);
+    }
+
+    /// Commits the current fence and attempt history.
     pub(super) fn save(&self, store: &Store) -> Result<(), &'static str> {
         store.write(self).map_err(|_| CREDENTIAL_REFRESH_LIMITED)
     }

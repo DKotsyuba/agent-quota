@@ -61,7 +61,7 @@ impl OAuthState {
 pub(crate) struct ClaudeLogin {
     /// Claude configuration directory that owns `.credentials.json`.
     pub directory: PathBuf,
-    /// True when the CLI must receive this directory as `CLAUDE_CONFIG_DIR`.
+    /// True when ordinary credential resolution must use a directory-specific Keychain service.
     pub overridden: bool,
 }
 
@@ -73,13 +73,13 @@ impl fmt::Debug for ClaudeLogin {
 }
 
 impl ClaudeLogin {
-    /// Reads only expiry and refresh-token presence from the selected store.
+    /// Reads renewal facts from the selected Linux credential file without Keychain fallback.
     pub(crate) fn state(&self) -> Result<OAuthState, &'static str> {
-        claude_document(&self.directory, self.overridden)
-            .as_deref()
-            .and_then(oauth_document)
-            .map(|(_, state)| state)
-            .ok_or(CREDENTIAL_UNAVAILABLE)
+        oauth_document(&read_private_file(
+            &self.directory.join(".credentials.json"),
+        )?)
+        .map(|(_, state)| state)
+        .ok_or(CREDENTIAL_UNAVAILABLE)
     }
 }
 
