@@ -68,42 +68,63 @@ run_as() {
     /usr/sbin/runuser -u "$selected_user" -- /usr/bin/env -i "$@"
 }
 
-# Echo only an allowlisted fixed probe failure code; any other diagnostic stays private.
+# Echo only an allowlisted fixed probe failure code.
 probe_code() {
-    local line
-    line=$(/usr/bin/head -c 128 -- "$1" 2>/dev/null | /usr/bin/head -n 1) || return 0
-    case $line in
+    case $1 in
         'quota probe: credential_unavailable' | 'quota probe: credential_expired' | \
         'quota probe: credential_refresh_failed' | 'quota probe: credential_refresh_limited' | \
+        'quota probe: credential_refresh_unsupported_host' | \
+        'quota probe: credential_refresh_cleanup_unconfirmed' | \
         'quota probe: external_probe_failed' | \
         'quota probe: external_config_invalid' | 'quota probe: external_source_unavailable' | \
         'quota probe: collector_output_invalid' | 'quota probe: collector_output_empty' | \
         'quota probe: collector_output_contains_credential')
-            printf '%s' "${line#quota probe: }" ;;
+            printf '%s' "${1#quota probe: }" ;;
     esac
 }
 
+# Retain the first line of at most 128 bytes. Drain the original pipe through EOF
+# so a noisy diagnostic cannot interrupt the probe with SIGPIPE.
+read_probe_code() {
+    local line
+    line=$(/usr/bin/head -c 128 | {
+        IFS= read -r line || :
+        /usr/bin/cat >/dev/null
+        probe_code "$line"
+    })
+    /usr/bin/cat >/dev/null
+    printf '%s' "$line"
+}
+
 # Capture a complete probe before submitting it; no credential or envelope is logged.
-# The probe's diagnostic goes to a root-private file in the lock directory, never to logs.
+# The diagnostic uses only pipes, so interruption leaves no files.
 collect() {
-    local observation code diagnostic="$lock_directory/probe-diagnostic"
+    local observation code
     if ! observation=$(
         {
-            run_as "$AQ_PROBE_USER" \
-                HOME="$AQ_PROBE_OS_HOME" USER="$AQ_PROBE_USER" LOGNAME="$AQ_PROBE_USER" \
-                PATH="$AQ_PROBE_PATH" TMPDIR="$AQ_PROBE_TMP" TMP="$AQ_PROBE_TMP" TEMP="$AQ_PROBE_TMP" \
-                "$AQ_BINARY" probe --home "$AQ_PROBE_PRIVATE_HOME" --config "$AQ_CONFIG" \
-                --account "$AQ_ACCOUNT" --provider "$AQ_PROVIDER" --source "$AQ_SOURCE" \
-                9<&- 2>"$diagnostic" |
-                /usr/bin/head -c "$((max_observation + 1))" 9<&-
-        } 2>/dev/null
+            # FD 3 sends observation stdout past the inner diagnostic capture.
+            exec 3>&1
+            if code=$(
+                run_as "$AQ_PROBE_USER" \
+                    HOME="$AQ_PROBE_OS_HOME" USER="$AQ_PROBE_USER" LOGNAME="$AQ_PROBE_USER" \
+                    PATH="$AQ_PROBE_PATH" TMPDIR="$AQ_PROBE_TMP" TMP="$AQ_PROBE_TMP" TEMP="$AQ_PROBE_TMP" \
+                    "$AQ_BINARY" probe --home "$AQ_PROBE_PRIVATE_HOME" --config "$AQ_CONFIG" \
+                    --account "$AQ_ACCOUNT" --provider "$AQ_PROVIDER" --source "$AQ_SOURCE" \
+                    9<&- 2>&1 1>&3 3>&- | read_probe_code 3>&- 9<&-
+            ); then
+                exit 0
+            fi
+            printf '\nquota probe: %s\n' "$code"
+            exit 1
+        } 2>/dev/null | /usr/bin/head -c "$((max_observation + 1))" 9<&-
     ) || (( ${#observation} > max_observation )); then
-        code=$(probe_code "$diagnostic")
-        /usr/bin/rm -f -- "$diagnostic"
+        code=
+        if (( ${#observation} < max_observation )); then
+            code=$(probe_code "${observation##*$'\n'}")
+        fi
         printf '%s\n' "quota owner collection: probe failed${code:+: $code}" >&2
         return 1
     fi
-    /usr/bin/rm -f -- "$diagnostic"
     if ! {
         printf '%s\n' "$observation" | run_as "$AQ_SERVICE_USER" \
             PATH=/usr/bin:/bin TMPDIR="$AQ_SERVICE_TMP" TMP="$AQ_SERVICE_TMP" TEMP="$AQ_SERVICE_TMP" \

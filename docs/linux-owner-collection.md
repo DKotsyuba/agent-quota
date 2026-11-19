@@ -41,7 +41,9 @@ The probe's diagnostic line is written to a root-private file in the lock
 directory and removed after the run. Only an allowlisted fixed code is appended
 to the journal message, for example
 `quota owner collection: probe failed: credential_expired`,
-`...: credential_refresh_failed` or `...: credential_refresh_limited`; any other
+`...: credential_refresh_failed`, `...: credential_refresh_limited`,
+`...: credential_refresh_unsupported_host` or
+`...: credential_refresh_cleanup_unconfirmed`. Any other
 diagnostic yields the generic `probe failed`.
 
 For a Claude login, `refresh_oauth = true` in the source's `[sources.harness]`
