@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.2.1
+
+Released 2026-11-19. Qualification in `family.toml` is unchanged from 0.1.1: Linux x86-64 on dobi, evidence from earlier candidates of the same source line, not the exact release bytes. Claude OAuth renewal is off by default and has not been exercised against a live login.
+
 ### Added
 
 - On native Linux, `refresh_oauth = true` in `[sources.harness]` enables one isolated Claude Code 2.1.322 Haiku turn to renew an unmanaged personal Claude login within five minutes of expiry. Renewal requires a trusted store path and allows at most six turns per store in a trailing 24-hour window. Quota never writes tokens. Live OAuth renewal has not been exercised.
