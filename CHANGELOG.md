@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Added
+
+- On native Linux, `refresh_oauth = true` in `[sources.harness]` enables one isolated Claude Code 2.1.322 Haiku turn to renew an unmanaged personal Claude login within five minutes of expiry. Renewal requires a trusted store path and allows at most six turns per store in a trailing 24-hour window. Quota never writes tokens. Live OAuth renewal has not been exercised.
+
+### Changed
+
+- A Claude OAuth token past its recorded `expiresAt` is no longer sent to the provider; collection fails with `credential_expired`, `credential_refresh_failed` when an attempted renewal left it expired, or `credential_refresh_limited` when the renewal cap prevented an attempt.
+- The owner-collection launcher appends an allowlisted probe failure code to its journal message (for example `probe failed: credential_expired`); other diagnostics stay private.
+
 ## 0.2.0
 
 Released 2026-11-19. Qualification in `family.toml` is unchanged from 0.1.1: Linux x86-64 on dobi, evidence from earlier candidates of the same source line, not the exact release bytes. The capacity ranking has not been exercised against live Agent Run integration on dobi.

@@ -15,6 +15,12 @@ configured collector code must therefore be trusted. A failed round
 preserves earlier observations and their original times. The supplied Codex,
 Claude, GLM and OpenCode Go collectors are external processes. Their source files under
 `scripts/collectors/` are embedded in the binary and may be exported explicitly.
+A Claude source may opt in to OAuth renewal: before a due collection of a token
+near expiry on native Linux, Quota checks the trusted store path, pinned CLI and unmanaged OAuth profile
+before starting one isolated print-mode turn. Claude Code renews its own store.
+A directory-anchored lock and synced ledger cap attempts at six per store in a
+trailing day and fence retries after unconfirmed cleanup. Quota checks the new
+expiry against the current clock before collecting and never writes tokens.
 Collectors normally execute as the service's OS user. An external probe and
 owner-only ingest path can be launched separately under the credential owner.
 An optional root-managed Linux launcher normally serializes those invocations;

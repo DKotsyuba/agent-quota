@@ -1,6 +1,7 @@
 # Reviewed baseline allowlist, not an assertion that every future dependency is acceptable.
 [advisories]
 yanked = "deny"
+# Owner approved 2026-11-18.
 ignore = [
     { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained (informational, no vulnerability); required by rmcp; re-check by 2027-02-01" },
 ]

@@ -17,7 +17,71 @@ use std::{
 
 /// Fixed error shared by unavailable, malformed and inaccessible credential stores.
 pub const CREDENTIAL_UNAVAILABLE: &str = "credential_unavailable";
+/// Fixed error for a Claude OAuth access token at or past its recorded expiry.
+pub const CREDENTIAL_EXPIRED: &str = "credential_expired";
+/// Fixed error when the configured Claude CLI left an expired OAuth login unrenewed.
+pub const CREDENTIAL_REFRESH_FAILED: &str = "credential_refresh_failed";
+/// Fixed error when the renewal attempt cap prevented renewing an expired OAuth login.
+pub const CREDENTIAL_REFRESH_LIMITED: &str = "credential_refresh_limited";
+/// The host, account or CLI is outside the supported OAuth renewal profile.
+pub const CREDENTIAL_REFRESH_UNSUPPORTED_HOST: &str = "credential_refresh_unsupported_host";
+/// A renewal process may still be active. The store must stay fenced.
+pub const CREDENTIAL_REFRESH_CLEANUP_UNCONFIRMED: &str = "credential_refresh_cleanup_unconfirmed";
 const MAX_SECRET_BYTES: usize = 64 * 1024;
+/// Claude Code renews its OAuth access token only within this many seconds of expiry.
+pub(crate) const CLAUDE_REFRESH_WINDOW_SECONDS: f64 = 300.0;
+
+/// Nonsecret facts about one Claude OAuth document; no token value is retained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OAuthState {
+    /// Recorded access-token expiry in Unix milliseconds, when the store has one.
+    pub expires_at_ms: Option<i64>,
+    /// Whether the store also holds a refresh token that its own CLI could use.
+    pub refreshable: bool,
+    /// The CLI's OAuth document identifies a personal subscription without remote policy.
+    pub personal_subscription: bool,
+}
+
+impl OAuthState {
+    /// True when the access token is at or past its recorded expiry at `at` (Unix seconds).
+    pub(crate) fn expired(self, at: f64) -> bool {
+        self.expires_at_ms
+            .is_some_and(|expiry| expiry as f64 / 1000.0 <= at)
+    }
+
+    /// True when Claude Code itself would renew the token at `at`; stores without expiry never are.
+    pub(crate) fn renewal_due(self, at: f64) -> bool {
+        self.expires_at_ms
+            .is_some_and(|expiry| expiry as f64 / 1000.0 <= at + CLAUDE_REFRESH_WINDOW_SECONDS)
+    }
+}
+
+/// Selected existing Claude login store; holds a location, never credential bytes.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ClaudeLogin {
+    /// Claude configuration directory that owns `.credentials.json`.
+    pub directory: PathBuf,
+    /// True when ordinary credential resolution must use a directory-specific Keychain service.
+    pub overridden: bool,
+}
+
+impl fmt::Debug for ClaudeLogin {
+    /// Redacts the login location like other credential references.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ClaudeLogin(<redacted>)")
+    }
+}
+
+impl ClaudeLogin {
+    /// Reads renewal facts from the selected Linux credential file without Keychain fallback.
+    pub(crate) fn state(&self) -> Result<OAuthState, &'static str> {
+        oauth_document(&read_private_file(
+            &self.directory.join(".credentials.json"),
+        )?)
+        .map(|(_, state)| state)
+        .ok_or(CREDENTIAL_UNAVAILABLE)
+    }
+}
 
 /// Harness identity used by the version-1 collector protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -181,13 +245,52 @@ impl CredentialRef {
         Ok(())
     }
 
+    /// True for native or named Claude Code logins, the only stores with OAuth renewal.
+    pub fn is_claude_login(&self) -> bool {
+        matches!(
+            self.0,
+            Location::Native(HarnessId::ClaudeCode) | Location::Named(HarnessId::ClaudeCode, _)
+        )
+    }
+
+    /// Selects the Claude login directory without reading it; `None` for other stores.
+    pub(crate) fn claude_login(
+        &self,
+        app_home: Option<&Path>,
+        runtime_home: Option<&Path>,
+        native_directory: Option<&Path>,
+    ) -> Result<Option<ClaudeLogin>, &'static str> {
+        Ok(Some(match &self.0 {
+            Location::Native(HarnessId::ClaudeCode) => {
+                let (directory, overridden) =
+                    native_config(HarnessId::ClaudeCode, native_directory)?;
+                ClaudeLogin {
+                    directory,
+                    overridden,
+                }
+            }
+            Location::Named(HarnessId::ClaudeCode, label) => ClaudeLogin {
+                directory: claude_account_config(
+                    app_home.ok_or(CREDENTIAL_UNAVAILABLE)?,
+                    runtime_home.ok_or(CREDENTIAL_UNAVAILABLE)?,
+                    label,
+                )?,
+                overridden: true,
+            },
+            _ => return Ok(None),
+        }))
+    }
+
     /// Resolves exactly this account for private stdin; native Codex only returns its directory.
+    /// A Claude OAuth token at or past its recorded expiry at `at` (Unix seconds) is refused
+    /// with [`CREDENTIAL_EXPIRED`] instead of being sent to the provider.
     /// The caller validates the binding before invoking this read-only operation.
     pub(crate) fn auth(
         &self,
         app_home: Option<&Path>,
         runtime_home: Option<&Path>,
         native_directory: Option<&Path>,
+        at: f64,
     ) -> Result<Value, &'static str> {
         let token = match &self.0 {
             Location::Native(HarnessId::Codex) => {
@@ -201,18 +304,17 @@ impl CredentialRef {
                     .join(label);
                 return Ok(json!({"kind":"native_login", "directory":directory}));
             }
-            Location::Native(HarnessId::ClaudeCode) => {
-                let (directory, overridden) =
-                    native_config(HarnessId::ClaudeCode, native_directory)?;
-                claude_oauth(&directory, overridden)?
-            }
-            Location::Named(HarnessId::ClaudeCode, label) => {
-                let directory = claude_account_config(
-                    app_home.ok_or(CREDENTIAL_UNAVAILABLE)?,
-                    runtime_home.ok_or(CREDENTIAL_UNAVAILABLE)?,
-                    label,
-                )?;
-                claude_oauth(&directory, true)?
+            Location::Native(HarnessId::ClaudeCode) | Location::Named(HarnessId::ClaudeCode, _) => {
+                let login = self
+                    .claude_login(app_home, runtime_home, native_directory)?
+                    .ok_or(CREDENTIAL_UNAVAILABLE)?;
+                let document = claude_document(&login.directory, login.overridden)
+                    .ok_or(CREDENTIAL_UNAVAILABLE)?;
+                let (token, state) = oauth_document(&document).ok_or(CREDENTIAL_UNAVAILABLE)?;
+                if state.expired(at) {
+                    return Err(CREDENTIAL_EXPIRED);
+                }
+                token
             }
             Location::Environment(name) => {
                 checked_secret(std::env::var(name).map_err(|_| CREDENTIAL_UNAVAILABLE)?)?
@@ -332,17 +434,16 @@ fn claude_account_config(
     }
 }
 
-/// Reads a Claude token from its private JSON store or that same login's Keychain service.
-fn claude_oauth(directory: &Path, overridden: bool) -> Result<String, &'static str> {
+/// Reads the Claude OAuth document holding an access token from the private JSON store or,
+/// failing that, the same login's Keychain service. The caller must not log the result.
+fn claude_document(directory: &Path, overridden: bool) -> Option<String> {
     if let Ok(document) = read_private_file(&directory.join(".credentials.json"))
-        && let Some(token) = access_token(&document)
+        && oauth_document(&document).is_some()
     {
-        return Ok(token);
+        return Some(document);
     }
     keychain_lookup(&keychain_service(directory, overridden), None)
-        .as_deref()
-        .and_then(access_token)
-        .ok_or(CREDENTIAL_UNAVAILABLE)
+        .filter(|document| oauth_document(document).is_some())
 }
 
 /// Matches Claude Code's service name; explicit directories append eight SHA-256 hex digits.
@@ -358,17 +459,39 @@ fn keychain_service(directory: &Path, overridden: bool) -> String {
     format!("Claude Code-credentials-{suffix}")
 }
 
-/// Extracts only a bounded nonempty access token; parse failures never expose the document.
-fn access_token(document: &str) -> Option<String> {
+/// Extracts a bounded nonempty access token with its expiry and refresh-token presence.
+/// Parse failures never expose the document; the refresh token itself is never returned.
+/// A missing or malformed `expiresAt` is treated as no recorded expiry.
+fn oauth_document(document: &str) -> Option<(String, OAuthState)> {
     let value: Value = serde_json::from_str(document).ok()?;
-    checked_secret(
-        value
-            .pointer("/claudeAiOauth/accessToken")
-            .or_else(|| value.get("accessToken"))?
-            .as_str()?
-            .to_owned(),
-    )
-    .ok()
+    let oauth = match value.get("claudeAiOauth") {
+        Some(nested) if nested.get("accessToken").is_some() => nested,
+        _ => &value,
+    };
+    let token = checked_secret(oauth.get("accessToken")?.as_str()?.to_owned()).ok()?;
+    let state = OAuthState {
+        expires_at_ms: oauth
+            .get("expiresAt")
+            .and_then(Value::as_i64)
+            .filter(|expiry| *expiry > 0),
+        refreshable: oauth
+            .get("refreshToken")
+            .and_then(Value::as_str)
+            .is_some_and(|refresh| !refresh.is_empty()),
+        personal_subscription: matches!(
+            oauth.get("subscriptionType").and_then(Value::as_str),
+            Some("pro" | "max")
+        ) && ["gatewayToken", "primaryApiKey"]
+            .iter()
+            .all(|name| value.get(name).is_none_or(Value::is_null)),
+    };
+    Some((token, state))
+}
+
+/// Extracts only a bounded nonempty access token; parse failures never expose the document.
+#[cfg(test)]
+fn access_token(document: &str) -> Option<String> {
+    oauth_document(document).map(|(token, _)| token)
 }
 
 /// Detects echoes of the context's direct token in JSON keys or values.
@@ -659,7 +782,8 @@ mod tests {
             reference.auth(
                 Some(directory.path()),
                 Some(&directory.path().join("runtime")),
-                None
+                None,
+                0.0
             ),
             Err(CREDENTIAL_UNAVAILABLE)
         );

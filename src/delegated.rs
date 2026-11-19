@@ -11,6 +11,7 @@ use crate::{
         CollectorScope, MAX_OUTPUT_MODELS, MAX_OUTPUT_WINDOWS, NormalizedQuotaSnapshot,
         normalize_collector_output,
     },
+    refresh,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -110,7 +111,15 @@ pub(crate) async fn probe(
 ) -> Result<Value, String> {
     let (config, revision) = QuotaConfig::load_versioned(config_path)?;
     let unit = binding(&config, account, provider, source)?;
-    let context = unit.context(now()?).map_err(|_| "credential_unavailable")?;
+    // Only an opted-in Claude login near expiry starts its own CLI here.
+    refresh::renew_if_due(&unit, home, now()?).await?;
+    let context = unit.context(now()?).map_err(|code| {
+        if code == credentials::CREDENTIAL_EXPIRED {
+            code
+        } else {
+            credentials::CREDENTIAL_UNAVAILABLE
+        }
+    })?;
     let collector = unit
         .collector
         .as_ref()
@@ -352,6 +361,48 @@ source = "provider-quota"
         .await
         .unwrap_err();
         assert_eq!(error, "external_source_unavailable");
+    }
+
+    #[tokio::test]
+    async fn expired_claude_login_is_reported_before_the_collector_runs() {
+        let directory = tempfile::tempdir().unwrap();
+        let login = directory.path().join("claude-config");
+        std::fs::create_dir(&login).unwrap();
+        let store = login.join(".credentials.json");
+        std::fs::write(
+            &store,
+            r#"{"claudeAiOauth":{"accessToken":"SYNTHETIC_PROBE_SECRET","expiresAt":1000}}"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let marker = directory.path().join("collector-ran");
+        let script = directory.path().join("probe.sh");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\n: > '{}'\nexit 1\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let config = fixture()
+            .replace("provider = \"openai\"", "provider = \"claude\"")
+            .replace("auth_family = \"openai\"", "auth_family = \"anthropic\"")
+            .replace("\"native:codex\"", "\"native:claude-code\"")
+            .replace("/synthetic/codex", login.to_str().unwrap())
+            .replace("id = \"codex\"", "id = \"claude-code\"")
+            .replace("/synthetic/bin/quota", script.to_str().unwrap());
+        let path = directory.path().join("config.toml");
+        std::fs::write(&path, config).unwrap();
+        let error = probe(
+            &path,
+            directory.path(),
+            "account-one",
+            "claude",
+            "provider-quota",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, credentials::CREDENTIAL_EXPIRED);
+        assert!(!marker.exists());
     }
 
     #[tokio::test]

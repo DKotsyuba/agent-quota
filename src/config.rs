@@ -7,6 +7,7 @@
 //! the account/models as configured but unobserved, without resolving credentials.
 //! Optional source `app_home` locates named logins; Claude named logins also need
 //! `harness.home`. `native_directory` explicitly overrides a native login's home.
+//! `harness.refresh_oauth` opts a Claude login in to renewal by its own CLI.
 //! Without that override only context creation consults the harness's native
 //! environment convention. Unknown fields and literal/untyped secrets are rejected.
 //! Capacity ranking uses an optional source `priority_multiplier` (account weight
@@ -16,7 +17,7 @@
 pub use crate::credentials::HarnessId;
 use crate::{
     collector::CollectorBinding,
-    credentials::{CREDENTIAL_UNAVAILABLE, CredentialRef},
+    credentials::{CREDENTIAL_EXPIRED, CREDENTIAL_UNAVAILABLE, CredentialRef},
     quota::{AccountId, MAX_OUTPUT_MODELS},
 };
 use serde::Deserialize;
@@ -147,6 +148,10 @@ pub struct HarnessConfig {
     /// Existing runtime home required to resolve legacy named Claude logins.
     #[serde(default)]
     pub home: Option<PathBuf>,
+    /// Opt-in: before a due collection, let one isolated print-mode turn of `binary` renew
+    /// a Claude OAuth login within Claude Code's own renewal window. Claude logins only.
+    #[serde(default)]
+    pub refresh_oauth: bool,
 }
 
 /// Provider model alias and optional native quota lane.
@@ -346,6 +351,11 @@ impl SourceConfig {
                 self.native_directory.as_deref(),
             )
             .map_err(str::to_owned)?;
+        if self.harness.refresh_oauth
+            && (self.harness.id != HarnessId::ClaudeCode || !self.credential.is_claude_login())
+        {
+            return Err("oauth_refresh_unsupported".into());
+        }
         if !positive_finite(self.priority_multiplier) {
             return Err("source_ranking_invalid".into());
         }
@@ -410,7 +420,8 @@ impl SourceConfig {
 
     /// Builds version-1 private collector stdin; never log, persist or return this value to users.
     /// Native Codex passes a home directory; all other supported stores pass only their token.
-    /// Refuses unobserved sources before any credential lookup.
+    /// Refuses unobserved sources before any credential lookup. Credential failures return
+    /// `credential_unavailable`, or `credential_expired` for an expired Claude OAuth token.
     pub fn context(&self, at: f64) -> Result<Value, &'static str> {
         if !at.is_finite() || at < 0.0 {
             return Err("collector_input_invalid");
@@ -425,8 +436,15 @@ impl SourceConfig {
                 self.app_home.as_deref(),
                 self.harness.home.as_deref(),
                 self.native_directory.as_deref(),
+                at,
             )
-            .map_err(|_| CREDENTIAL_UNAVAILABLE)?;
+            .map_err(|code| {
+                if code == CREDENTIAL_EXPIRED {
+                    code
+                } else {
+                    CREDENTIAL_UNAVAILABLE
+                }
+            })?;
         let models: BTreeMap<_, _> = self
             .models
             .iter()

@@ -4,6 +4,7 @@ set -euo pipefail
 source "$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)/agent-quota-owner-collect.sh"
 fixture=${AQ_TEST_TMP:?}
 mkdir "$fixture/lock"
+lock_directory="$fixture/lock"
 
 if [[ $(/usr/bin/stat -c '%u' /usr/bin/env) == 0 ]]; then
     trusted_path /usr/bin/env file
@@ -77,7 +78,17 @@ run_as() {
             printf '%s\n' '{"version":1,"observation":{"synthetic":true}}'
         fi
         if [[ -e $fixture/probe-fail ]]; then
-            printf '%s\n' 'synthetic-private-diagnostic' >&2
+            printf '%s\n' "$(<"$fixture/probe-fail")" >&2
+            if [[ -e $fixture/noisy ]]; then
+                /usr/bin/head -c 262144 /dev/zero | /usr/bin/tr '\0' x >&2 || return 2
+                : > "$fixture/noise-drained"
+            fi
+            return 1
+        fi
+        if [[ -e $fixture/interrupt ]]; then
+            printf '%s\n' 'SYNTHETIC_PRIVATE_STDERR' >&2
+            printf '%s\n' ready > "$fixture/probe-ready"
+            read -r _ < "$fixture/probe-release"
             return 1
         fi
     else
@@ -98,15 +109,50 @@ done < "$fixture/probe-args"
 (( found == 1 ))
 [[ $(<"$fixture/observation") == '{"version":1,"observation":{"synthetic":true}}' ]]
 
+[[ ! -e $fixture/lock/probe-diagnostic ]]
 rm "$fixture/ingest-calls"
-: > "$fixture/probe-fail"
-if collect 2>"$fixture/error"; then
-    printf '%s\n' 'late probe failure was accepted' >&2
-    exit 1
-fi
-[[ ! -e $fixture/ingest-calls ]]
+# Only allowlisted fixed codes reach the journal; other diagnostics stay generic.
+for diagnostic in 'synthetic-private-diagnostic' 'quota probe: SYNTHETIC_SECRET_CANARY' \
+    'quota probe: credential_expired' 'quota probe: credential_refresh_failed' \
+    'quota probe: credential_refresh_limited' 'quota probe: credential_refresh_unsupported_host' \
+    'quota probe: credential_refresh_cleanup_unconfirmed'; do
+    printf '%s\n' "$diagnostic" > "$fixture/probe-fail"
+    if collect 2>"$fixture/error"; then
+        printf '%s\n' 'late probe failure was accepted' >&2
+        exit 1
+    fi
+    [[ ! -e $fixture/ingest-calls && ! -e $fixture/lock/probe-diagnostic ]]
+    case $diagnostic in
+        'quota probe: credential_'*)
+            expected="quota owner collection: probe failed: ${diagnostic#quota probe: }" ;;
+        *) expected='quota owner collection: probe failed' ;;
+    esac
+    [[ $(<"$fixture/error") == "$expected" ]]
+done
+
+: > "$fixture/noisy"
+printf '%s\n' 'quota probe: credential_refresh_cleanup_unconfirmed' > "$fixture/probe-fail"
+if collect 2>"$fixture/error"; then exit 1; fi
+[[ -e $fixture/noise-drained ]]
+[[ $(<"$fixture/error") == 'quota owner collection: probe failed: credential_refresh_cleanup_unconfirmed' ]]
+# A code found only past byte 128 is discarded, even when a complete line follows it.
+printf '%0130d\n%s\n' 0 'quota probe: credential_expired' > "$fixture/probe-fail"
+if collect 2>"$fixture/error"; then exit 1; fi
 [[ $(<"$fixture/error") == 'quota owner collection: probe failed' ]]
+rm "$fixture/noisy"
 rm "$fixture/probe-fail"
+
+mkfifo "$fixture/probe-ready" "$fixture/probe-release"
+: > "$fixture/interrupt"
+(collect) 2>"$fixture/error" &
+collection=$!
+read -r ready < "$fixture/probe-ready"
+[[ $ready == ready ]]
+kill -TERM "$collection"
+printf '%s\n' release > "$fixture/probe-release"
+if wait "$collection"; then exit 1; fi
+[[ -z $(/usr/bin/find "$lock_directory" -mindepth 1 -print -quit) ]]
+rm "$fixture/interrupt"
 
 : > "$fixture/oversize"
 if collect 2>"$fixture/error"; then
