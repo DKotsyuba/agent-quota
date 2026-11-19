@@ -173,50 +173,82 @@ pub(crate) fn restricted_environment(
     Ok(environment)
 }
 
-/// Runs a prepared argument-only helper with null stdio in its own process group.
+/// Outcome of a bounded helper invocation. Only cleanup uncertainty fences later attempts.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum HelperError {
+    /// Spawn, exit, output or deadline failure with no outstanding process.
+    Failed,
+    /// A spawned process or its descendants could not be proven stopped.
+    CleanupUnconfirmed,
+}
+
+/// Runs a prepared argument-only helper in its own process group.
 ///
-/// Nothing the helper prints is read, so its output cannot reach diagnostics. The deadline
-/// covers the whole run; the leader and its observed descendants are then cleaned up even
-/// after a normal exit. Returns the exit status, or a fixed code on spawn, timeout or
-/// unconfirmed cleanup.
-pub(crate) async fn run_silent(
+/// Stdin and stderr are null. Only an explicitly requested, bounded stdout is returned.
+/// Hold the waitable leader PID until cleanup to fence group reuse and reach surviving
+/// group members even after the leader exits.
+pub(crate) async fn run_helper(
     mut command: tokio::process::Command,
     timeout: Duration,
-) -> Result<std::process::ExitStatus, &'static str> {
+    output_limit: Option<usize>,
+) -> Result<Vec<u8>, HelperError> {
     command
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(if output_limit.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stderr(Stdio::null())
         .kill_on_drop(true);
     use std::os::unix::process::CommandExt;
     command.as_std_mut().process_group(0);
-    let mut child = command.spawn().map_err(|_| "helper_spawn_failed")?;
+    let mut child = command.spawn().map_err(|_| HelperError::Failed)?;
     let pid = child
         .id()
         .and_then(|pid| i32::try_from(pid).ok())
-        .ok_or("helper_process_identity_unavailable")?;
+        .ok_or(HelperError::CleanupUnconfirmed)?;
     let mut guard = ProcessGuard {
-        owner: OwnedProcess::capture(pid),
+        owner: OwnedProcess::capture_unreaped_child(pid),
         armed: true,
     };
-    let deadline = tokio::time::sleep(timeout);
-    tokio::pin!(deadline);
+    let deadline = tokio::time::Instant::now() + timeout;
     let mut tick = tokio::time::interval(Duration::from_millis(25));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let status = loop {
-        tokio::select! {
-            result = child.wait() => break result.map_err(|_| "helper_wait_failed"),
-            _ = &mut deadline => break Err("helper_timeout"),
-            _ = tick.tick() => guard.owner.refresh(),
+    let exited = loop {
+        if !guard.owner.child_running() {
+            break true;
         }
+        if tokio::time::timeout_at(deadline, tick.tick())
+            .await
+            .is_err()
+        {
+            break false;
+        }
+        guard.owner.refresh();
     };
     let cleanup = guard.owner.cleanup(Duration::from_millis(250)).await;
     guard.armed = false;
     let reaped = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
-    if !cleanup.is_ok_and(|proof| proof.confirmed) || !matches!(reaped, Ok(Ok(_))) {
-        return Err("helper_cleanup_unverified");
+    let Ok(Ok(status)) = reaped else {
+        return Err(HelperError::CleanupUnconfirmed);
+    };
+    if !cleanup.is_ok_and(|proof| proof.confirmed) {
+        return Err(HelperError::CleanupUnconfirmed);
     }
-    status
+    if !exited || !status.success() {
+        return Err(HelperError::Failed);
+    }
+    match (output_limit, child.stdout.take()) {
+        (Some(limit), Some(stdout)) => {
+            tokio::time::timeout_at(deadline, bounded_read(stdout, limit))
+                .await
+                .map_err(|_| HelperError::CleanupUnconfirmed)?
+                .map_err(|_| HelperError::Failed)
+        }
+        (None, _) => Ok(Vec::new()),
+        _ => Err(HelperError::Failed),
+    }
 }
 
 /// Executes exactly the configured command/args with private JSON stdin and bounded streams.

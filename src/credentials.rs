@@ -23,6 +23,10 @@ pub const CREDENTIAL_EXPIRED: &str = "credential_expired";
 pub const CREDENTIAL_REFRESH_FAILED: &str = "credential_refresh_failed";
 /// Fixed error when the renewal attempt cap prevented renewing an expired OAuth login.
 pub const CREDENTIAL_REFRESH_LIMITED: &str = "credential_refresh_limited";
+/// The host, account or CLI is outside the supported OAuth renewal profile.
+pub const CREDENTIAL_REFRESH_UNSUPPORTED_HOST: &str = "credential_refresh_unsupported_host";
+/// A renewal process may still be active. The store must stay fenced.
+pub const CREDENTIAL_REFRESH_CLEANUP_UNCONFIRMED: &str = "credential_refresh_cleanup_unconfirmed";
 const MAX_SECRET_BYTES: usize = 64 * 1024;
 /// Claude Code renews its OAuth access token only within this many seconds of expiry.
 pub(crate) const CLAUDE_REFRESH_WINDOW_SECONDS: f64 = 300.0;
@@ -34,6 +38,8 @@ pub(crate) struct OAuthState {
     pub expires_at_ms: Option<i64>,
     /// Whether the store also holds a refresh token that its own CLI could use.
     pub refreshable: bool,
+    /// The CLI's OAuth document identifies a personal subscription without remote policy.
+    pub personal_subscription: bool,
 }
 
 impl OAuthState {
@@ -472,6 +478,12 @@ fn oauth_document(document: &str) -> Option<(String, OAuthState)> {
             .get("refreshToken")
             .and_then(Value::as_str)
             .is_some_and(|refresh| !refresh.is_empty()),
+        personal_subscription: matches!(
+            oauth.get("subscriptionType").and_then(Value::as_str),
+            Some("pro" | "max")
+        ) && ["gatewayToken", "primaryApiKey"]
+            .iter()
+            .all(|name| value.get(name).is_none_or(Value::is_null)),
     };
     Some((token, state))
 }

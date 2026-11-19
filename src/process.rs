@@ -519,6 +519,8 @@ pub(crate) struct OwnedProcess {
     /// False means no descendant set was ever verified, so cleanup reports the
     /// descendant scope as unknown rather than clean.
     descendants_observed: bool,
+    /// The supervisor will keep its own child PID unreaped through cleanup.
+    unreaped_child: bool,
 }
 impl OwnedProcess {
     /// Capture the spawned leader identity without assuming failure is death.
@@ -542,20 +544,42 @@ impl OwnedProcess {
             pid,
             known,
             descendants_observed,
+            unreaped_child: false,
         }
+    }
+
+    /// Tracks a newly spawned group leader while the caller retains its waitable PID.
+    /// A zombie still pins the group identity, so its surviving members can be cleaned up.
+    pub(crate) fn capture_unreaped_child(pid: i32) -> Self {
+        let mut owner = Self::capture(pid);
+        owner.unreaped_child = true;
+        owner.descendants_observed = owner.leader.as_ref().is_some_and(|p| p.group == pid);
+        owner
+    }
+
+    /// Checks whether an unreaped child still has work to do, without releasing its PID.
+    pub(crate) fn child_running(&self) -> bool {
+        self.leader.as_ref().is_some_and(|p| {
+            observe(Some(p.pid), Some(&p.token), Some(p.birth)) == ProcessState::Alive
+        })
+    }
+
+    /// A live leader, or an exact child kept as a zombie by our caller, owns its group.
+    fn owns_group(&self, leader: &Identity) -> bool {
+        leader.group == self.pid
+            && inspect(leader.pid).is_ok_and(|p| {
+                p.token == leader.token
+                    && p.group == leader.group
+                    && (!p.zombie || self.unreaped_child)
+            })
     }
     /// Record descendants visible from a complete native process snapshot.
     ///
-    /// Captured identities accumulate in `known` and survive later refreshes, so
-    /// a descendant seen while the leader lived is still probed individually by
-    /// `cleanup`. On Linux, new group members are captured only while the
-    /// recorded leader is alive; its number may name an unrelated later group.
-    /// The snapshot counts as *verified* descendant evidence only when
-    /// the captured leader is itself observably alive: after it exits, a
-    /// descendant which left the original process group is reachable through
-    /// neither parentage nor the group, so an empty snapshot then proves nothing.
-    /// A failed `processes()` call records nothing and
-    /// leaves the existing evidence untouched.
+    /// Captured identities survive later refreshes. New group members can be
+    /// attributed to a live leader or to our explicitly unreaped child whose PID
+    /// still pins the group. A descendant that left the group before observation
+    /// may be beyond the reach of both parentage and group checks. A failed
+    /// snapshot leaves existing evidence untouched.
     pub(crate) fn refresh(&mut self) {
         let Ok(all) = processes() else {
             return;
@@ -567,10 +591,7 @@ impl OwnedProcess {
         if leader_state == Some(ProcessState::Alive) {
             self.descendants_observed = true;
         }
-        #[cfg(target_os = "linux")]
-        let leader_owned = leader_state == Some(ProcessState::Alive);
-        #[cfg(not(target_os = "linux"))]
-        let leader_owned = matches!(leader_state, Some(ProcessState::Alive | ProcessState::Dead));
+        let leader_owned = self.leader.as_ref().is_some_and(|p| self.owns_group(p));
         // Expand only from currently verified owned parents, never an unverified reused PID.
         loop {
             let mut changed = false;
@@ -599,10 +620,7 @@ impl OwnedProcess {
     pub(crate) fn signal(&mut self, sig: i32) -> Result<bool> {
         self.refresh();
         let mut signalled = false;
-        if let Some(p) = &self.leader
-            && p.group == self.pid
-            && signal_allowed(observe(Some(p.pid), Some(&p.token), Some(p.birth)))
-        {
+        if self.leader.as_ref().is_some_and(|p| self.owns_group(p)) {
             // SAFETY: signal only the verified child-created process group; never group 0/1.
             let code = unsafe { libc::kill(-self.pid, sig) };
             if code == 0 {

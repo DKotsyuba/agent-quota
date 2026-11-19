@@ -80,36 +80,57 @@ minutes of expiry (Claude Code's own renewal window), Quota runs, as the
 executing user:
 
 ```text
-<binary> -p --model haiku --tools "" --strict-mcp-config --no-session-persistence \
-  --disable-slash-commands --setting-sources "" --settings '{"disableAllHooks":true}' \
+<binary> -p --model haiku --tools "" --strict-mcp-config --mcp-config '{"mcpServers":{}}' \
+  --no-session-persistence --disable-slash-commands --setting-sources "" \
+  --settings '{"disableAllHooks":true,"disableClaudeAiConnectors":true}' \
   --system-prompt "Reply with OK." -- "Reply with OK."
 ```
 
-Claude Code awaits its OAuth renewal before that single small model request,
-under the same cross-process refresh lock its agents use, and writes its own
-store with its own permissions. The turn therefore uses a tiny amount of the
-subscription. It has no tools, no MCP servers, no hooks, no user/project/local
-settings (and so no plugins), no slash commands and no saved session; managed
-policy settings still apply. stdin, stdout and stderr are null, so nothing the
-CLI prints is read or logged. The working and temporary directories are the
-private Quota home, the environment is the collector's restricted one plus
-`CLAUDE_CONFIG_DIR` naming the selected login (for named or explicitly located
-logins) and `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`. The run is bounded to
-90 seconds and its process group is cleaned up. Quota never exchanges, copies or
-writes a token, contacts no endpoint itself, and reads only the new expiry.
-`claude auth status` is deliberately not used: in Claude Code 2.1.322 its renewal
-runs unawaited, so the process can exit while a rotated token is still unsaved.
+The supported profile is the official Claude Code **2.1.322** executable and an
+unmanaged personal Pro or Max OAuth login on Linux or macOS. Quota probes the
+exact version with private bounded stdout and without the login environment.
+Managed settings take precedence over the hook flag, and a managed MCP file
+conflicts with strict MCP configuration. Quota checks for `managed-settings.json`,
+`managed-settings.d`, `managed-mcp.json` and `CLAUDE.md` under
+`/etc/claude-code` on Linux or `/Library/Application Support/ClaudeCode` on macOS.
+It also checks the macOS managed preference domain and the login's cached remote
+settings. The profile requires a Keychain login on macOS and excludes alternate
+Anthropic profiles. A managed file, an inaccessible policy location, WSL, an ineligible
+login, or an unrecognized CLI version returns `credential_refresh_unsupported_host`.
+See [Claude Code managed settings](https://code.claude.com/docs/en/managed-settings),
+[server-managed settings](https://code.claude.com/docs/en/server-managed-settings),
+and the [CLI reference](https://code.claude.com/docs/en/cli-reference).
 
-Renewal is single-flight: a non-blocking lock (`oauth-renewal.lock`) in the
-private Quota home skips the CLI while another renewal runs. At most six CLI
-runs per login are started in any trailing 24 hours; the private ledger
-`oauth-renewals.json` in the same home records only attempt times under a digest
-of the login path. A corrupt, foreign-owned or non-private ledger refuses
-renewal rather than lifting the cap; remove it to reset.
+Claude Code awaits its OAuth renewal before the single small model request and
+writes its own credential store. The turn uses a small amount of the subscription.
+The renewal CLI gets a fixed system `PATH`, the credential owner's `HOME`, an
+explicit `CLAUDE_CONFIG_DIR` when needed, private `TMPDIR`, `LANG=C`, and fixed
+settings to suppress nonessential traffic and Claude.ai MCP. Collector
+`env_from` grants apply exclusively to the collector. The turn has null stdio,
+a 90-second deadline and process-group cleanup. `claude auth status` can exit
+before this CLI version finishes saving the rotated token. `--bare` skips the
+OAuth credentials used by this profile.
 
-The CLI's exit status does not report renewal; the store does. If the token is
-still valid but was not renewed, collection proceeds and the next due collection
-tries again. If it has expired, the collection fails with
+The canonical Claude configuration directory identifies the store by device and
+inode. Linux requires the private credential file to belong to that directory
+without file-level symlinks or hard links. A private `.agent-quota-oauth-renewal.lock` and
+`.agent-quota-oauth-renewals.json` in that directory coordinate aliases and
+different Quota homes. The synced ledger caps the store at six attempts in a
+trailing 24 hours. Recent entries in a version-1 Quota-home ledger also count
+until they age out, regardless of the old path spelling. Inaccessible, malformed
+or non-private ledger state prevents a launch.
+
+Quota syncs a pending marker before invoking the CLI and clears it after confirmed
+cleanup. If termination is uncertain, including after an interrupted collection,
+Quota reports `credential_refresh_cleanup_unconfirmed` and leaves the store
+fenced beyond the daily window. Recovery requires the credential owner to verify
+the previous invocation and its descendants are stopped before clearing only the
+ledger's `pending` flag, preserving its attempt times.
+
+Quota rechecks the store and wall clock after the CLI exits, then checks the
+wall clock again immediately before resolving collector credentials. If the token
+remains valid after a confirmed run with no renewal, collection proceeds and the
+next due collection can try again. If it has expired, the collection fails with
 `credential_refresh_failed`, with `credential_refresh_limited` when the cap (or an
 unusable ledger) prevented the attempt, or with `credential_expired` when the
 store has no refresh token (the CLI is then not started). A store without

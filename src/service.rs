@@ -283,7 +283,7 @@ impl Engine {
                     refresh::renew_if_due(source, &self.home, at)
                         .await
                         .map_err(str::to_owned)?;
-                    let context = source.context(at).map_err(str::to_owned)?;
+                    let context = source.context(now()).map_err(str::to_owned)?;
                     let raw = collector::run(binding, &context, &self.home).await?;
                     if credentials::output_contains_credential(&raw, &context) {
                         return Err("collector_output_contains_credential".to_owned());
