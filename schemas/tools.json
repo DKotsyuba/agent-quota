@@ -51,7 +51,7 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Rank configured providers and their models by stored quota capacity (highest first), applying Quota's provider and account multipliers. Shows each model's status (available, limited, unknown, exhausted), remaining percentage, limiting window, reset and evidence freshness. Account-free: no account or pool identities. Read-only; does not contact providers or start models.",
+    "description": "Rank configured providers and their models by stored quota capacity (highest first), applying Quota's provider and account multipliers. Shows each model's status (available, limited, unknown, priority_overflow, exhausted), remaining percentage, limiting window, reset and evidence freshness. Account-free: no account or pool identities. Read-only; does not contact providers or start models.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {

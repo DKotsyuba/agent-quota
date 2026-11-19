@@ -148,26 +148,31 @@ The ranking is agent-run's former provider capacity order, now owned by Quota:
   maximum, never a sum. `ordered_accounts = true` ranks with neutral weights.
 - Per account, a `known` model whose `state_validity` is still valid has
   priority `quota_score * account multiplier`; a valid `exhausted` model is
-  exhausted; anything else, including an expired bound or a non-finite
-  priority, is unknown.
+  exhausted. A valid known model whose weighted priority overflows has
+  `priority_overflow`. An expired bound or other unavailable evidence is unknown.
 - Model `status`: `available` if any account has known capacity at low or
   medium risk; `limited` if all accounts with known capacity are at `high`
   risk (the existing forecast rule: at most 10% remaining, or burn above the
-  sustainable rate); otherwise `unknown` if any account is unknown; otherwise
-  `exhausted`. `best_priority` is the highest known priority.
+  sustainable rate). With no known priority, the status is `unknown` if any
+  eligible lane is unknown, `priority_overflow` if any overflows, and
+  `exhausted` otherwise. `best_priority` is the highest known priority.
 - `evidence` is `fresh` for a known or exhausted decision, `stale` when
-  samples exist but none is current, and `missing` otherwise.
+  samples exist but yield no known priority or exhaustion decision, and
+  `missing` otherwise.
   `exhausted_until` is the earliest known reset of the exhausted accounts.
 - Provider `score` is the best model priority times the provider
   `priority_multiplier` (saturated at the largest finite number), or null
-  without known capacity. Providers sort by score, then best status
-  (`available`, `limited`, `unknown`, `exhausted`), then name.
-- Detail fields (`limiting_window`, `remaining_percent`, `reset_at`, `risk`,
-  `valid_until`, `windows`, at most 8) describe one representative account: the
-  highest-priority usable account, or the soonest-reset exhausted one. Unknown
-  models have no representative.
+  without known capacity. Providers sort by descending score, then best
+  model status in Agent Run's order (known, `unknown`, `priority_overflow`,
+  `exhausted`), then name. Both `available` and `limited` count as known.
+- For a scored row, `native_model`, `limiting_window`, `remaining_percent`,
+  `reset_at`, `risk`, `valid_until` and `windows` (at most 8) come from the
+  account and native lane that supplied `best_priority`. The status still
+  summarizes all eligible lanes and `newest_observed_at` uses their newest
+  observation. Exhausted rows use the soonest-reset exhausted lane for those
+  details. Unknown and overflow rows have no representative details.
 - `coverage.incomplete` is true when collection coverage is not `complete` or
-  any eligible account is unknown.
+  any eligible lane is unknown or its weighted priority overflows.
 
 No account, pool, credential or source-command identity is returned. The
 order is quota-only: account enablement, cooldowns, pins and active-attempt
