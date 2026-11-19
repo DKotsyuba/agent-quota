@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.2.0
+
+Released 2026-11-19. Qualification in `family.toml` is unchanged from 0.1.1: Linux x86-64 on dobi, evidence from earlier candidates of the same source line, not the exact release bytes. The capacity ranking has not been exercised against live Agent Run integration on dobi.
+
 ### Added
 
 - Capacity ranking moved from agent-run: optional source `priority_multiplier` (account weight per provider binding; an account's weight on a model is the maximum of its bindings) and `[providers.<alias>]` tables with `priority_multiplier` and `ordered_accounts`. Omitted values are neutral, so existing configurations stay valid.

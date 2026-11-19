@@ -1,4 +1,4 @@
-THIRD-PARTY NOTICES for agent-quota 0.1.1
+THIRD-PARTY NOTICES for agent-quota 0.2.0
 
 agent-quota is MIT-licensed (see LICENSE). The Rust crates listed below are the locked,
 non-development, non-build dependencies of the executable from the committed Cargo.lock:
