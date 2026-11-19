@@ -10,6 +10,9 @@
 //! `harness.refresh_oauth` opts a Claude login in to renewal by its own CLI.
 //! Without that override only context creation consults the harness's native
 //! environment convention. Unknown fields and literal/untyped secrets are rejected.
+//! Capacity ranking uses an optional source `priority_multiplier` (account weight
+//! for that provider binding) and optional `[providers.<alias>]` tables with
+//! `priority_multiplier` and `ordered_accounts`; both default to neutral.
 
 pub use crate::credentials::HarnessId;
 use crate::{
@@ -45,6 +48,33 @@ pub struct QuotaConfig {
     /// At most 256 declarations; an empty list is valid and performs no collection.
     #[serde(default)]
     pub sources: Vec<SourceConfig>,
+    /// Optional provider ranking policy keyed by a configured provider alias.
+    /// An absent entry ranks with multiplier one and unordered accounts.
+    #[serde(default)]
+    pub providers: BTreeMap<String, ProviderRanking>,
+}
+
+/// Provider-level capacity ranking policy, migrated from agent-run's provider table.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderRanking {
+    /// Positive finite provider weight applied to its best model priority; default one.
+    #[serde(default = "one")]
+    pub priority_multiplier: f64,
+    /// Account weights choose a fallback sequence rather than scale quota scores;
+    /// capacity ranking then uses neutral account weights for this provider.
+    #[serde(default)]
+    pub ordered_accounts: bool,
+}
+
+impl Default for ProviderRanking {
+    /// Neutral policy for a provider without an explicit entry.
+    fn default() -> Self {
+        Self {
+            priority_multiplier: 1.0,
+            ordered_accounts: false,
+        }
+    }
 }
 
 /// Whether quota is collected by an external executable or remains unobserved.
@@ -100,6 +130,11 @@ pub struct SourceConfig {
     /// Exact invocation policy, required for `exec` and forbidden for `none`.
     #[serde(default)]
     pub collector: Option<CollectorBinding>,
+    /// Positive finite account weight for this provider binding, default one.
+    /// The effective weight of an account on one model is the maximum of its
+    /// eligible bindings, never a sum. It affects only capacity ranking.
+    #[serde(default = "one")]
+    pub priority_multiplier: f64,
 }
 
 /// Harness metadata only; a harness is never started while loading configuration.
@@ -154,6 +189,16 @@ fn default_interval() -> u64 {
 /// Returns the default retained sample ceiling.
 fn default_retention() -> usize {
     1000
+}
+
+/// Returns the neutral ranking multiplier.
+fn one() -> f64 {
+    1.0
+}
+
+/// Accepts agent-run's ranking weights: positive and finite.
+fn positive_finite(value: f64) -> bool {
+    value.is_finite() && value > 0.0
 }
 
 impl QuotaConfig {
@@ -214,6 +259,17 @@ impl QuotaConfig {
             || self.sources.len() > MAX_SOURCES
         {
             return Err("config_bounds_invalid".into());
+        }
+        for (provider, ranking) in &self.providers {
+            if !provider_identifier(provider)
+                || !positive_finite(ranking.priority_multiplier)
+                || !self
+                    .sources
+                    .iter()
+                    .any(|source| &source.provider == provider)
+            {
+                return Err("provider_ranking_invalid".into());
+            }
         }
         let mut accounts: BTreeMap<&AccountId, &SourceConfig> = BTreeMap::new();
         let mut units: BTreeMap<(AccountId, String), SourceConfig> = BTreeMap::new();
@@ -299,6 +355,9 @@ impl SourceConfig {
             && (self.harness.id != HarnessId::ClaudeCode || !self.credential.is_claude_login())
         {
             return Err("oauth_refresh_unsupported".into());
+        }
+        if !positive_finite(self.priority_multiplier) {
+            return Err("source_ranking_invalid".into());
         }
         if self.limits_source == LimitsSource::None && self.execution == ExecutionMode::External {
             return Err("none_external_forbidden".into());
@@ -770,6 +829,53 @@ source = "provider-quota"
         assert_eq!(
             source.source().unwrap(),
             "exec:f20fb0a82809bed34b10a88a505dc64b702352d35226323c87a6dd61fea5f365"
+        );
+    }
+
+    /// Ranking policy defaults to neutral and rejects invalid weights or unknown providers.
+    #[test]
+    fn ranking_multipliers_default_validate_and_reference_configured_providers() {
+        let base = fixture();
+        let config = QuotaConfig::parse(base).unwrap();
+        assert!(config.providers.is_empty());
+        assert!(
+            config
+                .sources
+                .iter()
+                .all(|source| source.priority_multiplier == 1.0)
+        );
+        let provider = config.sources[0].provider.clone();
+        let with = format!(
+            "{base}\n[providers.{provider}]\npriority_multiplier = 2.5\nordered_accounts = true\n"
+        );
+        let parsed = QuotaConfig::parse(&with).unwrap();
+        assert_eq!(parsed.providers[&provider].priority_multiplier, 2.5);
+        assert!(parsed.providers[&provider].ordered_accounts);
+        for bad in [
+            format!("{base}\n[providers.{provider}]\npriority_multiplier = 0.0\n"),
+            format!("{base}\n[providers.{provider}]\npriority_multiplier = -1.0\n"),
+            format!("{base}\n[providers.{provider}]\npriority_multiplier = inf\n"),
+            format!("{base}\n[providers.not-configured]\npriority_multiplier = 2.0\n"),
+            format!("{base}\n[providers.{provider}]\nunknown = 1\n"),
+        ] {
+            assert_eq!(
+                QuotaConfig::parse(&bad).unwrap_err(),
+                if bad.contains("unknown = 1") {
+                    "config_invalid"
+                } else {
+                    "provider_ranking_invalid"
+                }
+            );
+        }
+        let source = base.replace("models = [", "priority_multiplier = 0.0\nmodels = [");
+        assert_eq!(
+            QuotaConfig::parse(&source).unwrap_err(),
+            "source_ranking_invalid"
+        );
+        let weighted = base.replace("models = [", "priority_multiplier = 3.0\nmodels = [");
+        assert_eq!(
+            QuotaConfig::parse(&weighted).unwrap().sources[0].priority_multiplier,
+            3.0
         );
     }
 }

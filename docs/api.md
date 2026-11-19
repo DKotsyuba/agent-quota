@@ -12,6 +12,7 @@ Clients must configure the expected service UID when it differs from their own.
 ```json
 {"version":1,"method":"status","accounts":[]}
 {"version":1,"method":"snapshot","accounts":["account-example"],"model":"model-example"}
+{"version":1,"method":"capacity","accounts":[],"model":"model-example"}
 ```
 
 For `snapshot`, omitted or empty `accounts` means all configured accounts;
@@ -49,8 +50,9 @@ The snapshot includes the persistent database `source_epoch`, committed quota
 coverage. Each account includes configured model states (`known`, `unknown`,
 or `exhausted`), physical pools, limiting window, remaining percentage, burn
 rate in percentage points per hour, reset time, risk, evidence and quota score.
-For known usable data, `quota_score` is `1 + limiting_window.slack`, matching
-agent-run before its own provider multipliers and local policy are applied.
+For known usable data, `quota_score` is `1 + limiting_window.slack`, before
+multipliers; the [capacity order](#capacity-order) applies the configured
+account and provider multipliers, and agent-run applies its local admission policy.
 Window details carry exact source, runtime, lane, target, membership, observation
 and validity times, forecast, and window explanation. `last_remaining_percent`
 and `last_reset_at` are nullable raw facts from the latest sample and remain
@@ -114,7 +116,69 @@ them. Narrow the account/model scope when `response_too_large` is returned;
 `history_too_large` requires operator attention. One absolute five-second I/O
 deadline applies to each socket exchange. The CLI `limits` prints the same
 snapshot JSON; MCP `get_quota` renders at most 20 model rows and asks for a
-narrower scope rather than omitting rows.
+narrower scope rather than omitting rows. The CLI `capacity` prints the capacity
+JSON; MCP `get_capacity` renders at most 60 model rows on the same terms.
+
+## Capacity order
+
+`capacity` is an account-free read added within protocol version 1; a service
+older than this method answers `unsupported_method`. `accounts` must be empty;
+`model` optionally narrows the order to one configured or native model name
+(`unknown_model` otherwise). It reads every configured account once, at one
+evaluation clock, under the same configuration as the snapshot it ranks.
+
+```json
+{"schema_version":1,"source_epoch":"...","revision":12,"config_revision":"...",
+ "evaluated_at":1763490000.0,"coverage":{"state":"complete","incomplete":false},
+ "providers":[{"provider":"codex","priority_multiplier":1.0,"score":2.62,"status":"available",
+   "models":[{"model":"gpt","native_model":"gpt","status":"available","best_priority":2.62,
+     "evidence":"fresh","newest_observed_at":1763489900.0,"exhausted_until":null,
+     "limiting_window":"five_hour","remaining_percent":64.0,"reset_at":1763500000.0,
+     "risk":"low","valid_until":1763490800.0,
+     "windows":[{"window":"five_hour","source":"codex-appserver","known":true,
+       "remaining_percent":64.0,"reset_at":1763500000.0,
+       "observed_at":1763489900.0,"valid_until":1763490800.0}]}]}]}
+```
+
+The ranking is agent-run's former provider capacity order, now owned by Quota:
+
+- A provider offers the models of its `[[sources]]` in declaration order. A
+  source's account is eligible for its own models with the source's
+  `priority_multiplier`; an account with several eligible sources uses the
+  maximum, never a sum. `ordered_accounts = true` ranks with neutral weights.
+- Per account, a `known` model whose `state_validity` is still valid has
+  priority `quota_score * account multiplier`; a valid `exhausted` model is
+  exhausted. A valid known model whose weighted priority overflows has
+  `priority_overflow`. An expired bound or other unavailable evidence is unknown.
+- Model `status`: `available` if any account has known capacity at low or
+  medium risk; `limited` if all accounts with known capacity are at `high`
+  risk (the existing forecast rule: at most 10% remaining, or burn above the
+  sustainable rate). With no known priority, the status is `unknown` if any
+  eligible lane is unknown, `priority_overflow` if any overflows, and
+  `exhausted` otherwise. `best_priority` is the highest known priority.
+- `evidence` is `fresh` for a known or exhausted decision, `stale` when
+  samples exist but yield no known priority or exhaustion decision, and
+  `missing` otherwise.
+  `exhausted_until` is the earliest known reset of the exhausted accounts.
+- Provider `score` is the best model priority times the provider
+  `priority_multiplier` (saturated at the largest finite number), or null
+  without known capacity. Providers sort by descending score, then best
+  model status in Agent Run's order (known, `unknown`, `priority_overflow`,
+  `exhausted`), then name. Both `available` and `limited` count as known.
+- For a scored row, `native_model`, `limiting_window`, `remaining_percent`,
+  `reset_at`, `risk`, `valid_until` and `windows` (at most 8) come from the
+  account and native lane that supplied `best_priority`. The status still
+  summarizes all eligible lanes and `newest_observed_at` uses their newest
+  observation. Exhausted rows use the soonest-reset exhausted lane for those
+  details. Unknown and overflow rows have no representative details.
+- `coverage.incomplete` is true when collection coverage is not `complete` or
+  any eligible lane is unknown or its weighted priority overflows.
+
+No account, pool, credential or source-command identity is returned. The
+order is quota-only: account enablement, cooldowns, pins and active-attempt
+limits are agent-run admission state and are not applied. Like the snapshot,
+the result is an estimate at `evaluated_at`, not a reservation; a client must
+not use it as an admission fence.
 
 ## Credential-owner probe
 

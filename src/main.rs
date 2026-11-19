@@ -2,6 +2,7 @@
 mod advice;
 mod assets;
 mod backoff;
+mod capacity;
 mod collector;
 mod config;
 mod credentials;
@@ -69,6 +70,21 @@ enum Commands {
         /// Restrict the response to one configured or native model name.
         #[arg(long)]
         model: Option<String>,
+    },
+    /// Read the account-free provider/model capacity order from the running service as JSON.
+    Capacity {
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        #[arg(long)]
+        server_uid: Option<u32>,
+        /// Restrict the order to one configured or native model name.
+        #[arg(long)]
+        model: Option<String>,
+    },
+    /// Host hook surface: context injection for `UserPromptSubmit`.
+    Hook {
+        #[command(subcommand)]
+        command: HookCommand,
     },
     /// Read the running service's nonsecret collection status as JSON.
     ServiceStatus {
@@ -138,6 +154,39 @@ enum Commands {
         command: ReleaseCommand,
     },
 }
+/// Host hook subcommands.
+#[derive(Subcommand)]
+enum HookCommand {
+    /// Print the provider capacity order for a `UserPromptSubmit` hook.
+    ///
+    /// Read-only and stateless: one bounded capacity read from the local
+    /// service socket. Always exits 0 and prints nothing on any error.
+    Context {
+        /// Host harness; both consume the same `additionalContext` envelope.
+        #[arg(long, default_value = "claude")]
+        host: Host,
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        #[arg(long)]
+        server_uid: Option<u32>,
+        /// Character budget for the block; capped at 2500.
+        #[arg(long, default_value_t = capacity::HOOK_DEFAULT_CHARS)]
+        max_chars: usize,
+    },
+}
+
+/// Host harness selection for `hook context`.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum Host {
+    /// Claude Code.
+    Claude,
+    /// Codex.
+    Codex,
+}
+
+/// Overall deadline for the hook's service read; a slow service yields no context.
+const HOOK_READ_DEADLINE: std::time::Duration = std::time::Duration::from_millis(750);
+
 #[derive(Subcommand)]
 enum ContractCommand {
     Export,
@@ -180,7 +229,7 @@ impl ServerHandler for Handler {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
-            .with_instructions("Use get_status for identity and get_quota for stored quota observations. Tool descriptions define effects.")
+            .with_instructions("Use get_status for identity, get_capacity for the account-free provider/model capacity order and get_quota for per-account quota observations. Tool descriptions define effects.")
     }
     /// Return the static catalog; modern requests cache it privately for 60 seconds.
     /// Pagination is unused; legacy sessions retain their original wire fields.
@@ -405,6 +454,43 @@ async fn read_service(
     }
 }
 
+/// Reads the capacity order once and renders the compact hook block; any failure is empty.
+async fn hook_context(
+    socket: Option<PathBuf>,
+    server_uid: Option<u32>,
+    max_chars: usize,
+) -> String {
+    let Ok(path) = socket_path(socket) else {
+        return String::new();
+    };
+    let request = ipc::Request {
+        version: 1,
+        method: "capacity".into(),
+        accounts: Vec::new(),
+        model: None,
+        observation: None,
+    };
+    let uid = server_uid.unwrap_or_else(ipc::owner_uid);
+    match tokio::time::timeout(HOOK_READ_DEADLINE, ipc::request(&path, &request, uid)).await {
+        Ok(Ok(ipc::Reply::Result { result, .. })) => capacity::hook_text(result, max_chars),
+        _ => String::new(),
+    }
+}
+
+/// Prints one `UserPromptSubmit` context envelope accepted by Claude Code and Codex.
+/// Write failures are ignored so the hook always exits quietly.
+#[allow(
+    clippy::print_stdout,
+    reason = "Explicit hook branch, never MCP output"
+)]
+fn print_context(text: &str) {
+    use std::io::Write;
+    let envelope = serde_json::json!({
+        "hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": text}
+    });
+    let _ = writeln!(std::io::stdout().lock(), "{envelope}");
+}
+
 /// Reads a bounded worker envelope from stdin and submits it once to the owner-only endpoint.
 async fn ingest_service(socket: Option<PathBuf>) -> ExitCode {
     let path = match socket_path(socket) {
@@ -593,6 +679,27 @@ async fn main() -> ExitCode {
             accounts,
             model,
         } => read_service(socket, server_uid, "snapshot", accounts, model).await,
+        Commands::Capacity {
+            socket,
+            server_uid,
+            model,
+        } => read_service(socket, server_uid, "capacity", Vec::new(), model).await,
+        Commands::Hook {
+            command:
+                HookCommand::Context {
+                    host: _,
+                    socket,
+                    server_uid,
+                    max_chars,
+                },
+        } => {
+            // The hook must never break the host: every outcome is a silent exit 0.
+            let text = hook_context(socket, server_uid, max_chars).await;
+            if !text.is_empty() {
+                print_context(&text);
+            }
+            ExitCode::SUCCESS
+        }
         Commands::ServiceStatus { socket, server_uid } => {
             read_service(socket, server_uid, "status", Vec::new(), None).await
         }

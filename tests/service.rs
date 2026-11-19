@@ -245,7 +245,47 @@ source = "fixture-source"
             .unwrap()
             .contains("model-a")
     );
+    let capacity = client
+        .call_tool(CallToolRequestParams::new("get_capacity"))
+        .await
+        .unwrap();
+    let wire = serde_json::to_value(capacity).unwrap();
+    assert_eq!(wire["isError"], false, "{wire}");
+    let text = wire["content"][0]["text"].as_str().unwrap();
+    assert!(text.starts_with("Capacity order at "), "{text}");
+    assert!(text.contains("1. \"codex\" | status: available"), "{text}");
+    assert!(!text.contains("fixture\""), "{text}");
     client.cancel().await.unwrap();
+    let output = Command::new(binary())
+        .arg("capacity")
+        .arg("--socket")
+        .arg(&socket)
+        .output()
+        .await
+        .unwrap();
+    assert!(output.status.success());
+    let cli: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(cli["providers"][0]["provider"], "codex");
+    assert_eq!(cli["providers"][0]["models"][0]["status"], "available");
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("\"fixture\""));
+    let hook = Command::new(binary())
+        .args(["hook", "context", "--host", "codex", "--socket"])
+        .arg(&socket)
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .unwrap();
+    assert!(hook.status.success());
+    let envelope: Value = serde_json::from_slice(&hook.stdout).unwrap();
+    assert_eq!(
+        envelope["hookSpecificOutput"]["hookEventName"],
+        "UserPromptSubmit"
+    );
+    let context = envelope["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
+    assert!(context.starts_with("Provider capacity order (highest first; read-only"));
+    assert!(context.ends_with("1. provider=\"codex\"; models=[\"model-a\":available]"));
     write_script(&script, "#!/bin/sh\ncat >/dev/null\nexit 7\n");
     let failed = wait_for(&socket, "status", |value| {
         value["result"]["last_collection"]["sources"][0]["status"] == "failed"
@@ -560,4 +600,34 @@ source = "fixture-source"
     let retained = request(&socket, "snapshot").await;
     assert_eq!(retained["result"]["revision"], after["result"]["revision"]);
     stop(&mut child).await;
+}
+
+/// Without a reachable service the hook prints nothing and still exits successfully.
+#[tokio::test]
+async fn hook_context_is_silent_without_service() {
+    let root = tempfile::tempdir().unwrap();
+    for args in [
+        vec!["hook", "context"],
+        vec!["hook", "context", "--max-chars", "0"],
+    ] {
+        let output = Command::new(binary())
+            .args(&args)
+            .arg("--socket")
+            .arg(root.path().join("absent.sock"))
+            .stdin(Stdio::null())
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.is_empty());
+    }
+    let relative = Command::new(binary())
+        .args(["hook", "context", "--socket", "relative.sock"])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .unwrap();
+    assert!(relative.status.success());
+    assert!(relative.stdout.is_empty());
 }
