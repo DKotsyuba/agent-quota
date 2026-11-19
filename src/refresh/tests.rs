@@ -755,6 +755,14 @@ fn process_stopped(pid: i32) -> bool {
 }
 
 #[tokio::test]
+async fn missing_store_path_component_is_unavailable() {
+    let mut fixture = Fixture::new(true);
+    fixture.source.native_directory = Some(fixture.root.join("missing").join("claude-config"));
+    assert_eq!(fixture.renew().await, Err(CREDENTIAL_UNAVAILABLE));
+    assert!(!fixture.root.join("version-calls").exists());
+}
+
+#[tokio::test]
 async fn missing_store_or_cli_fail_closed() {
     let fixture = Fixture::new(true);
     assert_eq!(fixture.renew().await, Err(CREDENTIAL_UNAVAILABLE));

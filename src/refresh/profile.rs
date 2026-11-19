@@ -5,7 +5,8 @@ use crate::{
     collector::{self, HelperError},
     config::SourceConfig,
     credentials::{
-        CREDENTIAL_REFRESH_CLEANUP_UNCONFIRMED, CREDENTIAL_REFRESH_UNSUPPORTED_HOST, ClaudeLogin,
+        CREDENTIAL_REFRESH_CLEANUP_UNCONFIRMED, CREDENTIAL_REFRESH_UNSUPPORTED_HOST,
+        CREDENTIAL_UNAVAILABLE, ClaudeLogin,
     },
 };
 use std::{
@@ -109,7 +110,10 @@ impl Host {
 
     /// Checks every CLI-facing path component before canonicalization can hide a symlink.
     pub(super) fn check_store_path(&self, path: &Path) -> Result<(), &'static str> {
-        trusted_ancestry(path, &self.ancestry_root).map_err(|_| CREDENTIAL_REFRESH_UNSUPPORTED_HOST)
+        trusted_ancestry(path, &self.ancestry_root).map_err(|error| match error.kind() {
+            ErrorKind::NotFound => CREDENTIAL_UNAVAILABLE,
+            _ => CREDENTIAL_REFRESH_UNSUPPORTED_HOST,
+        })
     }
 
     /// Validates the host and prepares the command without spawning any process.
