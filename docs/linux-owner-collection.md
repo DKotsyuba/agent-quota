@@ -42,7 +42,8 @@ directory and removed after the run. Only an allowlisted fixed code is appended
 to the journal message, for example
 `quota owner collection: probe failed: credential_expired`,
 `...: credential_refresh_failed`, `...: credential_refresh_limited`,
-`...: credential_refresh_unsupported_host` or
+`...: credential_refresh_unsupported_host`,
+`...: credential_refresh_unsupported_host (credential_refresh_policy_cache_unknown)` or
 `...: credential_refresh_cleanup_unconfirmed`. Any other
 diagnostic yields the generic `probe failed`.
 

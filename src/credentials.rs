@@ -25,6 +25,9 @@ pub const CREDENTIAL_REFRESH_FAILED: &str = "credential_refresh_failed";
 pub const CREDENTIAL_REFRESH_LIMITED: &str = "credential_refresh_limited";
 /// The host, account or CLI is outside the supported OAuth renewal profile.
 pub const CREDENTIAL_REFRESH_UNSUPPORTED_HOST: &str = "credential_refresh_unsupported_host";
+/// Unsupported renewal host with a safe, fixed reason for a rejected remote-settings cache.
+pub const CREDENTIAL_REFRESH_POLICY_CACHE_UNKNOWN: &str =
+    "credential_refresh_unsupported_host (credential_refresh_policy_cache_unknown)";
 /// A renewal process may still be active. The store must stay fenced.
 pub const CREDENTIAL_REFRESH_CLEANUP_UNCONFIRMED: &str = "credential_refresh_cleanup_unconfirmed";
 const MAX_SECRET_BYTES: usize = 64 * 1024;

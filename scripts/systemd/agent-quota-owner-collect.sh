@@ -74,6 +74,7 @@ probe_code() {
         'quota probe: credential_unavailable' | 'quota probe: credential_expired' | \
         'quota probe: credential_refresh_failed' | 'quota probe: credential_refresh_limited' | \
         'quota probe: credential_refresh_unsupported_host' | \
+        'quota probe: credential_refresh_unsupported_host (credential_refresh_policy_cache_unknown)' | \
         'quota probe: credential_refresh_cleanup_unconfirmed' | \
         'quota probe: external_probe_failed' | \
         'quota probe: external_config_invalid' | 'quota probe: external_source_unavailable' | \

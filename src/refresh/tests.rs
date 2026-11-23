@@ -305,8 +305,88 @@ async fn due_login_is_renewed_by_one_isolated_cli_turn() {
     assert_eq!(mode & 0o777, 0o600);
 }
 
+/// Exercises the cache exception through the full synthetic renewal path.
 #[tokio::test]
-async fn managed_hooks_mcp_and_remote_policy_refuse_launch() {
+async fn benign_remote_settings_cache_allows_renewal() {
+    let fixture = Fixture::new(true);
+    fixture.store(120, true);
+    fixture.mode("renew", 28_800);
+    let cache = fixture.login.join("remote-settings.json");
+    std::fs::write(&cache, r#"{"channelsEnabled":true}"#).unwrap();
+    std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o600)).unwrap();
+    // Policy limits and their sidecars are a separate Claude Code input.
+    for (name, content) in [
+        (
+            "remote-settings.json.signature.json",
+            r#"{"jws":"synthetic"}"#,
+        ),
+        ("remote-settings.json.signature-iat.json", "{}"),
+        ("policy-limits.json", r#"{"restrictions":{}}"#),
+        (
+            "policy-limits.json.signature.json",
+            r#"{"jws":"synthetic"}"#,
+        ),
+        ("policy-limits.json.signature-iat.json", "{}"),
+        ("policy-limits.json.stamp.json", "{}"),
+    ] {
+        std::fs::write(fixture.login.join(name), content).unwrap();
+    }
+    let fallback = fixture.host.home.join(".claude");
+    std::fs::create_dir_all(&fallback).unwrap();
+    std::fs::write(
+        fallback.join("remote-settings.json"),
+        r#"{"channelsEnabled":false}"#,
+    )
+    .unwrap();
+    assert_eq!(fixture.renew().await, Ok(Renewal::Renewed));
+    assert_eq!(fixture.calls().len(), 1);
+}
+
+/// Rejects untrusted cache content and file shapes before invoking Claude.
+#[tokio::test]
+async fn unsafe_remote_settings_cache_refuses_launch() {
+    use crate::credentials::CREDENTIAL_REFRESH_POLICY_CACHE_UNKNOWN;
+
+    let fixture = Fixture::new(true);
+    fixture.store(120, true);
+    let cache = fixture.login.join("remote-settings.json");
+    let refusal = Err(CREDENTIAL_REFRESH_POLICY_CACHE_UNKNOWN);
+    let oversized = format!("{{{}}}", " ".repeat(4095));
+    for content in [
+        r#"{"futureSetting":false}"#,
+        r#"{"channelsEnabled":true,"permissions":{}}"#,
+        r#"{"channelsEnabled":true,"channelsEnabled":false}"#,
+        r#"{"channelsEnabled":null}"#,
+        r#"[true]"#,
+        "{",
+        &oversized,
+    ] {
+        std::fs::write(&cache, content).unwrap();
+        assert_eq!(fixture.renew().await, refusal);
+    }
+    std::fs::write(&cache, "{}").unwrap();
+    for mode in [0o620, 0o602] {
+        std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(mode)).unwrap();
+        assert_eq!(fixture.renew().await, refusal);
+    }
+    std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let other = fixture.root.join("other");
+    std::fs::hard_link(&cache, &other).unwrap();
+    assert_eq!(fixture.renew().await, refusal);
+    std::fs::remove_file(&cache).unwrap();
+    std::os::unix::fs::symlink(&other, &cache).unwrap();
+    assert_eq!(fixture.renew().await, refusal);
+    std::fs::remove_file(&cache).unwrap();
+    std::fs::remove_file(&other).unwrap();
+    std::os::unix::fs::symlink(&other, &cache).unwrap();
+    assert_eq!(fixture.renew().await, refusal);
+    assert!(!fixture.root.join("version-calls").exists());
+    assert!(fixture.calls().is_empty());
+    assert!(!fixture.ledger_path().exists());
+}
+
+#[tokio::test]
+async fn managed_hooks_mcp_and_alternate_profile_refuse_launch() {
     let fixture = Fixture::new(true);
     fixture.store(120, true);
     std::fs::create_dir(&fixture.host.managed).unwrap();
@@ -336,13 +416,6 @@ async fn managed_hooks_mcp_and_remote_policy_refuse_launch() {
     );
     std::fs::remove_dir(drop_ins).unwrap();
 
-    let cached = fixture.login.join("remote-settings.json");
-    std::os::unix::fs::symlink(fixture.root.join("missing"), &cached).unwrap();
-    assert_eq!(
-        fixture.renew().await,
-        Err(CREDENTIAL_REFRESH_UNSUPPORTED_HOST)
-    );
-    std::fs::remove_file(cached).unwrap();
     let profile = fixture.host.home.join(".config/anthropic");
     std::fs::create_dir_all(&profile).unwrap();
     assert_eq!(

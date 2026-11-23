@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.2.2
+
+Dated 2026-11-23.
+
+### Fixed
+
+- Claude OAuth renewal accepts the pinned CLI's benign remote-settings cache with a boolean `channelsEnabled`. Unsafe or unrecognized caches still block renewal and identify the cache check in diagnostics.
+
 ## 0.2.1
 
 Released 2026-11-19. Qualification in `family.toml` is unchanged from 0.1.1: Linux x86-64 on dobi, evidence from earlier candidates of the same source line, not the exact release bytes. Claude OAuth renewal is off by default and has not been exercised against a live login.

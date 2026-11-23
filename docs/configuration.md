@@ -126,8 +126,15 @@ exact version with private bounded stdout and without the login environment.
 Managed settings take precedence over the hook flag, and a managed MCP file
 conflicts with strict MCP configuration. Quota checks for `managed-settings.json`,
 `managed-settings.d`, `managed-mcp.json` and `CLAUDE.md` under
-`/etc/claude-code`. It also checks the login's cached remote settings and excludes
-alternate Anthropic profiles. macOS and WSL return `credential_refresh_unsupported_host`,
+`/etc/claude-code`. It also excludes alternate Anthropic profiles.
+If present, a remote-settings cache in the selected login or default `.claude`
+location must be a readable, regular, single-link file owned by the probe user,
+with group and other write bits clear. It must contain a JSON object of at most
+4 KiB. The only allowed key is `channelsEnabled`, with one boolean value when
+present. The renewal turn enables no MCP channels. Refused caches report
+`credential_refresh_unsupported_host (credential_refresh_policy_cache_unknown)`.
+Claude Code continues to enforce its separate policy-limits cache and sidecars.
+macOS and WSL return `credential_refresh_unsupported_host`,
 as do managed policy, unreadable policy paths, ineligible logins and an unrecognized CLI.
 Existing credential collection without renewal still supports the macOS Keychain.
 See [Claude Code managed settings](https://code.claude.com/docs/en/managed-settings),
