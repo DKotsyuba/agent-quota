@@ -115,6 +115,7 @@ rm "$fixture/ingest-calls"
 for diagnostic in 'synthetic-private-diagnostic' 'quota probe: SYNTHETIC_SECRET_CANARY' \
     'quota probe: credential_expired' 'quota probe: credential_refresh_failed' \
     'quota probe: credential_refresh_limited' 'quota probe: credential_refresh_unsupported_host' \
+    'quota probe: credential_refresh_unsupported_host (credential_refresh_policy_cache_unknown)' \
     'quota probe: credential_refresh_cleanup_unconfirmed'; do
     printf '%s\n' "$diagnostic" > "$fixture/probe-fail"
     if collect 2>"$fixture/error"; then

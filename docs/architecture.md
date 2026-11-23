@@ -17,7 +17,9 @@ Claude, GLM and OpenCode Go collectors are external processes. Their source file
 `scripts/collectors/` are embedded in the binary and may be exported explicitly.
 A Claude source may opt in to OAuth renewal: before a due collection of a token
 near expiry on native Linux, Quota checks the trusted store path, pinned CLI and unmanaged OAuth profile
-before starting one isolated print-mode turn. Claude Code renews its own store.
+before starting one isolated print-mode turn. The remote-settings cache may contain
+an optional boolean `channelsEnabled` and must pass the policy file safety checks.
+Claude Code renews its own store.
 A directory-anchored lock and synced ledger cap attempts at six per store in a
 trailing day and fence retries after unconfirmed cleanup. Quota checks the new
 expiry against the current clock before collecting and never writes tokens.
