@@ -134,6 +134,13 @@ with group and other write bits clear. It must contain a JSON object of at most
 present. The renewal turn enables no MCP channels. Refused caches report
 `credential_refresh_unsupported_host (credential_refresh_policy_cache_unknown)`.
 Claude Code continues to enforce its separate policy-limits cache and sidecars.
+
+Quota checks the caches again after CLI qualification and before charging or
+launching the renewal turn. Claude Code opens the cache after this final check.
+The previous absence check had the same window. Quota accepts this race with
+the login owner or root as trusted writers. Other unprivileged UIDs have no
+write path through the checked directories or cache files.
+
 macOS and WSL return `credential_refresh_unsupported_host`,
 as do managed policy, unreadable policy paths, ineligible logins and an unrecognized CLI.
 Existing credential collection without renewal still supports the macOS Keychain.

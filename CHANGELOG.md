@@ -9,6 +9,7 @@ Dated 2026-11-23.
 ### Fixed
 
 - Claude OAuth renewal accepts the pinned CLI's benign remote-settings cache with a boolean `channelsEnabled`. Unsafe or unrecognized caches still block renewal and identify the cache check in diagnostics.
+  The final cache check leaves the same trusted-writer race as the previous absence check. Quota accepts updates by the login owner or root in that window. Other unprivileged UIDs have no write path.
 
 ## 0.2.1
 

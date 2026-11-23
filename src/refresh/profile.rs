@@ -293,6 +293,10 @@ impl Cli<'_> {
     }
 
     /// Rechecks the trusted store and qualified executable immediately before staging the turn.
+    ///
+    /// A cache can still change before Claude opens it. The previous absence check
+    /// had the same window. We accept this race with the login owner or root as
+    /// trusted writers. The checked paths give other unprivileged UIDs no write access.
     pub(super) fn print_command(&self, store: &Store) -> Result<Command, &'static str> {
         self.host.check(self.login, store)?;
         if executable_identity(&self.path)? != self.identity {

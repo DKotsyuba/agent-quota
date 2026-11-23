@@ -36,6 +36,9 @@ root='{root}'
 if [ "$1" = --version ]; then
     [ -z "${{CLAUDE_CONFIG_DIR+x}}" ] || exit 1
     printf '%s\n' version >> "$root/version-calls"
+    if [ -f "$root/cache-during-version" ]; then
+        cat "$root/cache-during-version" > "$root/claude-config/remote-settings.json"
+    fi
     cat "$root/version"
     exit 0
 fi
@@ -340,6 +343,51 @@ async fn benign_remote_settings_cache_allows_renewal() {
     .unwrap();
     assert_eq!(fixture.renew().await, Ok(Renewal::Renewed));
     assert_eq!(fixture.calls().len(), 1);
+}
+
+/// The default location remains subject to policy checks with a custom login.
+#[tokio::test]
+async fn unsafe_default_remote_settings_cache_refuses_launch() {
+    let fixture = Fixture::new(true);
+    fixture.store(120, true);
+    let fallback = fixture.host.home.join(".claude");
+    std::fs::create_dir_all(&fallback).unwrap();
+    std::fs::write(fallback.join("remote-settings.json"), r#"{"env":{}}"#).unwrap();
+
+    assert_eq!(
+        fixture.renew().await,
+        Err(crate::credentials::CREDENTIAL_REFRESH_POLICY_CACHE_UNKNOWN)
+    );
+    assert!(!fixture.root.join("version-calls").exists());
+    assert!(fixture.calls().is_empty());
+    assert!(!fixture.ledger_path().exists());
+}
+
+/// Qualification can change the cache, so the print turn must recheck it.
+#[tokio::test]
+async fn remote_settings_changed_during_qualification_refuses_print_turn() {
+    let fixture = Fixture::new(true);
+    fixture.store(120, true);
+    std::fs::write(
+        fixture.login.join("remote-settings.json"),
+        r#"{"channelsEnabled":true}"#,
+    )
+    .unwrap();
+    std::fs::write(fixture.root.join("cache-during-version"), r#"{"hooks":{}}"#).unwrap();
+
+    assert_eq!(
+        fixture.renew().await,
+        Err(crate::credentials::CREDENTIAL_REFRESH_POLICY_CACHE_UNKNOWN)
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.root.join("version-calls")).unwrap(),
+        "version\n"
+    );
+    assert!(fixture.calls().is_empty());
+    let ledger: Ledger =
+        serde_json::from_slice(&std::fs::read(fixture.ledger_path()).unwrap()).unwrap();
+    assert!(ledger.attempts.is_empty());
+    assert!(!ledger.pending);
 }
 
 /// Rejects untrusted cache content and file shapes before invoking Claude.
