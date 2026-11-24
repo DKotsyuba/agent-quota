@@ -6,7 +6,7 @@
 
 use crate::quota::{
     AccountId, NormalizedQuotaSnapshot, PhysicalQuotaKey, QuotaError, QuotaModelObservation,
-    QuotaWindow,
+    QuotaWindow, ResetCreditSnapshot, ResetCredits,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use std::{
@@ -141,6 +141,8 @@ pub struct AccountQuotaHistory {
     pub windows: Vec<StoredWindow>,
     /// Latches ordered by `(lane, source, window)`.
     pub latches: Vec<ExhaustionLatch>,
+    /// Last account-level credit observation or the unobserved default.
+    pub reset_credits: ResetCreditSnapshot,
 }
 
 /// An owned SQLite connection to this application's versioned quota database.
@@ -299,6 +301,12 @@ impl QuotaStore {
             // The file may have changed since the read-only check.
             verify_database(&tx)?;
         }
+        // Additive to version 1 so existing quota history and older readers remain valid.
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS quota_reset_credits (\
+             account_id TEXT PRIMARY KEY NOT NULL REFERENCES provider_accounts(account_id),\
+             observed_at REAL NOT NULL, inventory_json TEXT NOT NULL);",
+        )?;
         tx.commit()?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         Ok(Self { conn })
@@ -350,7 +358,7 @@ impl QuotaStore {
         record_quota_snapshot_on(&mut self.conn, runtime, snapshot, retention, at)
     }
 
-    /// Reads one account's history, latches, and revision in a single snapshot.
+    /// Reads one account's history, latches, reset credits and revision in a single snapshot.
     ///
     /// # Errors
     /// Returns a SQLite error if the database cannot be read.
@@ -408,11 +416,31 @@ impl QuotaStore {
                 }
             })
             .collect();
+        let stored_credits: Option<(f64, String)> = tx
+            .query_row(
+                "SELECT observed_at,inventory_json FROM quota_reset_credits WHERE account_id=?",
+                [account.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let reset_credits = if let Some((observed_at, json)) = stored_credits {
+            let inventory: ResetCredits = serde_json::from_str(&json)
+                .map_err(|_| invalid("invalid stored reset credit inventory"))?;
+            let snapshot = ResetCreditSnapshot {
+                observed_at: Some(observed_at),
+                inventory,
+            };
+            snapshot.validate()?;
+            snapshot
+        } else {
+            ResetCreditSnapshot::default()
+        };
         tx.commit()?;
         Ok(AccountQuotaHistory {
             revision,
             windows,
             latches,
+            reset_credits,
         })
     }
 }
@@ -755,6 +783,16 @@ fn record_quota_snapshot_on(
         }
     }
     let mut mutations = 0usize;
+    if let Some(observed_at) = snapshot.reset_credits.observed_at {
+        let inventory = serde_json::to_string(&snapshot.reset_credits.inventory)
+            .map_err(|_| invalid("invalid reset credit inventory"))?;
+        mutations += tx.execute(
+            "INSERT INTO quota_reset_credits(account_id,observed_at,inventory_json) VALUES(?,?,?) \
+             ON CONFLICT(account_id) DO UPDATE SET observed_at=excluded.observed_at,inventory_json=excluded.inventory_json \
+             WHERE excluded.observed_at >= quota_reset_credits.observed_at",
+            params![account.as_str(), observed_at, inventory],
+        )?;
+    }
     for (identity @ (lane, source, name), window) in &physical {
         let old_key = (lane.to_string(), source.to_string(), name.to_string());
         // A disjoint nonzero report cannot settle this latch. Persisting it
@@ -874,6 +912,62 @@ mod tests {
         let dir = tempfile::tempdir()?;
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))?;
         Ok(dir)
+    }
+
+    /// Upgrades a legacy store and retains only the newest account credit observation.
+    #[test]
+    fn reset_credits_survive_reopen_and_older_observations()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let dir = private_dir()?;
+        let path = dir.path().join("quota.sqlite");
+        let account: AccountId = "primary".parse()?;
+        let other: AccountId = "other".parse()?;
+        {
+            let mut store = QuotaStore::open(&path)?;
+            store.register_account(&account)?;
+            store.register_account(&other)?;
+            store.conn.execute("DROP TABLE quota_reset_credits", [])?;
+        }
+        let mut store = QuotaStore::open(&path)?;
+        assert_eq!(
+            store.read_account(&account)?.reset_credits,
+            Default::default()
+        );
+        let mut known = snapshot(&account, "fixture", json!([]))?;
+        known.reset_credits = ResetCreditSnapshot {
+            observed_at: Some(1000.0),
+            inventory: ResetCredits {
+                known: true,
+                available_count: Some(0),
+                credits: vec![],
+            },
+        };
+        store.record_snapshot("runtime", &known, 20, 1000.0)?;
+        drop(store);
+        let mut store = QuotaStore::open(&path)?;
+        assert_eq!(
+            store.read_account(&account)?.reset_credits,
+            known.reset_credits
+        );
+        assert_eq!(
+            store.read_account(&other)?.reset_credits,
+            Default::default()
+        );
+        let mut unknown = snapshot(&account, "fixture", json!([]))?;
+        unknown.reset_credits.observed_at = Some(999.0);
+        let before = store.read_account(&account)?;
+        assert_eq!(
+            store.record_snapshot("runtime", &unknown, 20, 1000.0)?,
+            before.revision
+        );
+        assert_eq!(store.read_account(&account)?, before);
+        unknown.reset_credits.observed_at = Some(1001.0);
+        store.record_snapshot("runtime", &unknown, 20, 1001.0)?;
+        assert_eq!(
+            store.read_account(&account)?.reset_credits,
+            unknown.reset_credits
+        );
+        Ok(())
     }
 
     /// Refuses special files and symlinks before SQLite can block or follow them.

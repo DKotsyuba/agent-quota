@@ -1,5 +1,5 @@
 //! Authoritative Rust tool registry. JSON discovery is an exported snapshot, not a second source.
-use crate::response::Templates;
+use crate::{quota::ResetCreditSnapshot, response::Templates};
 use mcp_presentation::Renderer;
 use rmcp::model::{CallToolResult, ContentBlock};
 use serde::{Deserialize, Serialize};
@@ -12,7 +12,7 @@ pub fn definitions() -> Vec<Value> {
         json!({"name":"get_status", "description":"Report the product name, version and release qualification. Read-only; does not access files or external services.",
         "inputSchema":{"type":"object","properties":{},"additionalProperties":false},
         "annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}}),
-        json!({"name":"get_quota", "description":"Read stored quota metrics from the local service. Does not contact providers or start models. Narrow account or model scope if the result is too large.",
+        json!({"name":"get_quota", "description":"Read stored quota metrics and account reset credits from the local service. Does not contact providers or start models. Narrow account or model scope if the result is too large.",
         "inputSchema":{"type":"object","properties":{"accounts":{"type":"array","items":{"type":"string"},"maxItems":256},"model":{"type":["string","null"],"maxLength":256}},"additionalProperties":false},
         "annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}}),
         json!({"name":"get_capacity", "description":"Rank configured providers and their models by stored quota capacity (highest first), applying Quota's provider and account multipliers. Shows each model's status (available, limited, unknown, priority_overflow, exhausted), remaining percentage, limiting window, reset and evidence freshness. Account-free: no account or pool identities. Read-only; does not contact providers or start models.",
@@ -29,7 +29,12 @@ pub fn templates() -> Vec<(&'static str, &'static str)> {
         ),
         (
             "quota",
-            "Quota at {{ evaluated_at }} | coverage: {{ coverage }}\n{% for row in rows %}{{ row.account }} | {{ row.provider }} | {{ row.model }} | {{ row.state }} | remaining: {{ row.remaining }} | burn/hour: {{ row.burn }} | reset: {{ row.reset }} | risk: {{ row.risk }}\n{% else %}No configured models in scope.\n{% endfor %}",
+            concat!(
+                "Quota at {{ evaluated_at }} | coverage: {{ coverage }}\n",
+                "{% for row in rows %}{{ row.account }} | {{ row.provider }} | {{ row.model }} | {{ row.state }} | remaining: {{ row.remaining }} | burn/hour: {{ row.burn }} | reset: {{ row.reset }} | risk: {{ row.risk }}\n{% else %}No configured models in scope.\n{% endfor %}",
+                "{% for row in reset_credits %}{{ row.account }} | reset credits: {% if row.known %}known{% else %}unknown{% endif %} | available count: {{ row.available_count }} | observed: {{ row.observed_at }}\n",
+                "{% for credit in row.credits %}  {{ credit.id }} | {{ credit.provider_kind }} | {{ credit.label }} | {{ credit.scope }} | resets left: {{ credit.resets_left }} | usable now: {{ credit.usable_now }} | granted: {{ credit.granted_at }} | expires: {{ credit.expires_at }}\n{% endfor %}{% endfor %}",
+            ),
         ),
         (
             "capacity",
@@ -115,6 +120,8 @@ struct Coverage {
 struct Account {
     account: String,
     models: Vec<Model>,
+    #[serde(default)]
+    reset_credits: ResetCreditSnapshot,
 }
 #[derive(Deserialize)]
 struct Model {
@@ -134,6 +141,29 @@ struct QuotaView {
     evaluated_at: f64,
     coverage: String,
     rows: Vec<QuotaRow>,
+    reset_credits: Vec<ResetCreditsView>,
+}
+
+/// One account inventory with display-safe provider labels and identifiers.
+#[derive(Serialize)]
+struct ResetCreditsView {
+    account: String,
+    known: bool,
+    available_count: String,
+    observed_at: String,
+    credits: Vec<ResetCreditView>,
+}
+/// Display-safe facts for one provider credit.
+#[derive(Serialize)]
+struct ResetCreditView {
+    id: String,
+    provider_kind: String,
+    label: String,
+    scope: String,
+    resets_left: String,
+    usable_now: String,
+    granted_at: String,
+    expires_at: String,
 }
 #[derive(Serialize)]
 struct QuotaRow {
@@ -179,8 +209,40 @@ fn quota_view(value: Value, filter: Option<&str>) -> Result<QuotaView, &'static 
         return Err("invalid_service_response");
     }
     let mut rows = Vec::new();
+    let mut reset_credits = Vec::new();
+    let mut credit_count = 0;
     for account in snapshot.accounts {
         let account_name = quoted(&account.account)?;
+        let credits = account.reset_credits;
+        credits.validate().map_err(|_| "invalid_service_response")?;
+        credit_count += credits.inventory.credits.len();
+        if credit_count > 20 || reset_credits.len() >= 20 {
+            return Err("response_too_large");
+        }
+        let rows_of_credits = credits
+            .inventory
+            .credits
+            .into_iter()
+            .map(|credit| {
+                Ok(ResetCreditView {
+                    id: quoted(&credit.id)?,
+                    provider_kind: quoted(&credit.provider_kind)?,
+                    label: quoted(&credit.label)?,
+                    scope: quoted(&credit.scope)?,
+                    resets_left: display_fact(credit.resets_left),
+                    usable_now: display_fact(credit.usable_now),
+                    granted_at: display_fact(credit.granted_at),
+                    expires_at: display_fact(credit.expires_at),
+                })
+            })
+            .collect::<Result<Vec<_>, &'static str>>()?;
+        reset_credits.push(ResetCreditsView {
+            account: account_name.clone(),
+            known: credits.inventory.known,
+            available_count: display_fact(credits.inventory.available_count),
+            observed_at: display_fact(credits.observed_at),
+            credits: rows_of_credits,
+        });
         for model in account.models {
             if filter.is_some_and(|wanted| wanted != model.model && wanted != model.native_model) {
                 continue;
@@ -215,7 +277,13 @@ fn quota_view(value: Value, filter: Option<&str>) -> Result<QuotaView, &'static 
         evaluated_at: snapshot.evaluated_at,
         coverage: snapshot.coverage.state,
         rows,
+        reset_credits,
     })
+}
+
+/// Displays an optional fact while preserving zero and false.
+fn display_fact(value: Option<impl ToString>) -> String {
+    value.map_or_else(|| "unknown".into(), |value| value.to_string())
 }
 
 /// Returns one fixed error without exposing socket paths or raw provider data.
@@ -520,6 +588,25 @@ mod tests {
             quota_view(snapshot, None),
             Err("response_too_large")
         ));
+    }
+
+    /// Renders account-level credit details once, including explicit false and zero.
+    #[test]
+    fn quota_renders_reset_credits() {
+        let snapshot = json!({"schema_version":2,"evaluated_at":1000.0,"coverage":{"state":"complete"},
+        "accounts":[{"account":"acct","models":[model("a"), model("b")],
+            "reset_credits":{"known":true,"available_count":0,"observed_at":999.0,"credits":[
+                {"id":"fixture-credit","provider_kind":"GRANT","scope":"all","label":"Fixture credit",
+                 "resets_left":2,"usable_now":false,"granted_at":null,"expires_at":4000.0}
+            ]}}]});
+        let view = quota_view(snapshot, None).unwrap();
+        let templates = Templates::new(&templates()).unwrap();
+        let text = templates.render("quota", &view).unwrap();
+        assert!(
+            text.contains(r#""acct" | reset credits: known | available count: 0 | observed: 999"#)
+        );
+        assert!(text.contains(r#""fixture-credit" | "GRANT" | "Fixture credit" | "all" | resets left: 2 | usable now: false | granted: unknown | expires: 4000"#));
+        assert_eq!(text.matches("fixture-credit").count(), 1);
     }
 
     /// Capacity pages escape labels, keep unknown explicit and refuse invalid or oversized results.

@@ -195,6 +195,85 @@ pub struct NormalizedQuotaSnapshot {
     pub account: AccountId,
     /// Explicit model memberships, bounded to 256 entries.
     pub models: Vec<QuotaModelObservation>,
+    /// Latest account-level credit observation, independent of model membership.
+    #[serde(default)]
+    pub reset_credits: ResetCreditSnapshot,
+}
+
+/// One banked reset credit or grant in the provider's account inventory.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResetCredit {
+    pub id: String,
+    pub provider_kind: String,
+    pub label: String,
+    pub scope: String,
+    pub resets_left: Option<u32>,
+    pub usable_now: Option<bool>,
+    pub granted_at: Option<f64>,
+    pub expires_at: Option<f64>,
+}
+
+/// Optional collector facts. An unknown inventory has no count or rows.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResetCredits {
+    pub known: bool,
+    pub available_count: Option<u32>,
+    pub credits: Vec<ResetCredit>,
+}
+
+/// Latest inventory and its Unix observation time, null before any observation.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ResetCreditSnapshot {
+    pub observed_at: Option<f64>,
+    #[serde(flatten)]
+    pub inventory: ResetCredits,
+}
+
+impl ResetCreditSnapshot {
+    /// Enforces collector and presentation bounds without logging rejected values.
+    pub(crate) fn validate(&self) -> Result<()> {
+        let inventory = &self.inventory;
+        if inventory.credits.len() > 64
+            || (!inventory.known
+                && (inventory.available_count.is_some() || !inventory.credits.is_empty()))
+            || (inventory.known && self.observed_at.is_none())
+            || self.observed_at.is_some_and(|n| !n.is_finite() || n < 0.0)
+        {
+            return Err(invalid("invalid reset credit inventory"));
+        }
+        for credit in &inventory.credits {
+            for (value, limit) in [
+                (&credit.id, 128),
+                (&credit.provider_kind, 64),
+                (&credit.label, 128),
+                (&credit.scope, 128),
+            ] {
+                if value.trim().is_empty()
+                    || value.len() > limit
+                    || value.chars().any(char::is_control)
+                {
+                    return Err(invalid("invalid reset credit text"));
+                }
+            }
+            if !(matches!(
+                credit.scope.as_str(),
+                "five_hour" | "seven_day" | "all" | "unknown"
+            ) || credit
+                .scope
+                .strip_prefix("model:")
+                .is_some_and(|id| !id.trim().is_empty()))
+                || [credit.granted_at, credit.expires_at]
+                    .into_iter()
+                    .flatten()
+                    .any(|n| !(0.0..=253402300799.0).contains(&n))
+            {
+                return Err(invalid("invalid reset credit scope or time"));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl NormalizedQuotaSnapshot {
@@ -207,6 +286,7 @@ impl NormalizedQuotaSnapshot {
     /// `(key, source, window)` repeated under several models must carry
     /// identical facts.
     pub fn validate(&self) -> Result<()> {
+        self.reset_credits.validate()?;
         if self.models.len() > 256 {
             return Err(invalid("too many quota models"));
         }
@@ -299,7 +379,7 @@ fn finite(value: Option<&Value>, code: &'static str) -> Result<Option<f64>> {
 /// optional `remaining_percent` (absent or null means unknown), optional
 /// `reset_at`, required `observed_at`, and optional `valid_until` defaulting
 /// to `observed_at + DEFAULT_WINDOW_TTL_SECONDS`. The envelope must declare
-/// `version` exactly `1` and carry no other top-level key; entry keys are
+/// `version` exactly `1` and may include `reset_credits`; entry keys are
 /// closed the same way. `observed_at` may not lie in the future of `host_now`.
 /// Foreign or unconfigured models, repeated model names, duplicate or
 /// conflicting pool windows, nonfinite or out-of-range numbers, inverted
@@ -328,7 +408,7 @@ pub fn normalize_collector_output(
         || envelope.get("version").and_then(Value::as_i64) != Some(1)
         || envelope
             .keys()
-            .any(|key| key != "version" && key != "windows")
+            .any(|key| !matches!(key.as_str(), "version" | "windows" | "reset_credits"))
     {
         return Err(invalid("quota_output_version"));
     }
@@ -477,9 +557,27 @@ pub fn normalize_collector_output(
         });
     }
     models.sort_by(|a, b| a.model.cmp(&b.model));
+    let inventory = envelope
+        .get("reset_credits")
+        .map(|value| serde_json::from_value(value.clone()))
+        .transpose()
+        .map_err(|_| invalid("invalid reset credit inventory"))?;
+    let observed_at = models
+        .iter()
+        .flat_map(|model| &model.pools)
+        .flat_map(|pool| &pool.windows)
+        .map(|window| window.observed_at)
+        .reduce(f64::max);
+    let reset_credits = inventory.map_or_else(ResetCreditSnapshot::default, |inventory| {
+        ResetCreditSnapshot {
+            observed_at: Some(observed_at.unwrap_or(host_now)),
+            inventory,
+        }
+    });
     let snapshot = NormalizedQuotaSnapshot {
         account: account.clone(),
         models,
+        reset_credits,
     };
     snapshot.validate()?;
     Ok(snapshot)
@@ -488,6 +586,40 @@ pub fn normalize_collector_output(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Keeps a legacy omission distinct from known zero and rejects malformed inventory.
+    #[test]
+    fn reset_credit_inventory_contract() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let account: AccountId = "fixture".parse()?;
+        let parse = |raw: &Value| normalize_collector_output(&account, &scope(), raw, 100.0, 8, 8);
+        let legacy = serde_json::json!({"version":1,"windows":[]});
+        assert_eq!(
+            parse(&legacy)?.reset_credits,
+            ResetCreditSnapshot::default()
+        );
+        let mut known_zero = legacy.clone();
+        known_zero["reset_credits"] =
+            serde_json::json!({"known":true,"available_count":0,"credits":[]});
+        assert_eq!(
+            parse(&known_zero)?.reset_credits.inventory.available_count,
+            Some(0)
+        );
+        for bad in [
+            serde_json::json!(null),
+            serde_json::json!({"known":false,"available_count":0,"credits":[]}),
+            serde_json::json!({"known":true,"available_count":0,"credits":[],"token":"fixture"}),
+            serde_json::json!({"known":true,"available_count":-1,"credits":[]}),
+        ] {
+            let mut invalid = legacy.clone();
+            invalid["reset_credits"] = bad;
+            assert!(parse(&invalid).is_err());
+        }
+        let credit = serde_json::json!({"id":"synthetic","provider_kind":"GRANT","label":"Fixture",
+            "scope":"five_hour","resets_left":1,"usable_now":true,"granted_at":null,"expires_at":null});
+        known_zero["reset_credits"]["credits"] = serde_json::json!(vec![credit; 65]);
+        assert!(parse(&known_zero).is_err());
+        Ok(())
+    }
     use serde_json::json;
 
     /// The collector scope used by the synthetic normalization checks.

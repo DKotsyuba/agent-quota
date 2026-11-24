@@ -34,7 +34,7 @@
         "known":true, "remaining_percent":80.0, "reset_at":2e-305, "warmup":false,
         "risk":"low", "recommendations":[]
       }],
-      "advice_key":"f52db427aff23ec59c9a4e18d3f7b83f"
+      "reset_credits":{"known":false,"available_count":null,"observed_at":null,"credits":[]}, "advice_key":"f52db427aff23ec59c9a4e18d3f7b83f"
     }]
   }
 }

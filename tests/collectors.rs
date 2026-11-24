@@ -58,10 +58,18 @@ fn endpoint_with_status(
     status: &'static str,
     body: &'static str,
 ) -> (String, std::thread::JoinHandle<String>) {
+    endpoints(vec![(status, body)])
+}
+
+/// Serves sequential fixture responses from one origin and records their requests.
+fn endpoints(
+    responses: Vec<(&'static str, &'static str)>,
+) -> (String, std::thread::JoinHandle<String>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let address = format!("http://{}/quota", listener.local_addr().unwrap());
     let handle = std::thread::spawn(move || {
+        responses.into_iter().map(|(status, body)| {
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut stream = loop {
             if let Ok((stream, _)) = listener.accept() {
@@ -86,6 +94,7 @@ fn endpoint_with_status(
         }
         write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
         String::from_utf8(bytes).unwrap()
+    }).collect::<Vec<_>>().join("\n")
     });
     (address, handle)
 }
@@ -114,7 +123,11 @@ async fn http_collectors_preserve_auth_and_normalized_windows() {
             3,
         ),
     ] {
-        let (url, server) = endpoint(body);
+        let (url, server) = if name == "glm" {
+            endpoints(vec![("200 OK", body), ("503 Unavailable", "{}")])
+        } else {
+            endpoint(body)
+        };
         let script = assets.path().join(format!("assets/collectors/{name}.sh"));
         let mut child = tokio::process::Command::new("/bin/bash")
             .arg(script)
@@ -146,13 +159,17 @@ async fn http_collectors_preserve_auth_and_normalized_windows() {
             expected_windows
         );
         assert!(!result.to_string().contains("synthetic-fixture-token"));
-        assert!(
-            server
-                .join()
-                .unwrap()
-                .to_ascii_lowercase()
-                .contains(authorization)
-        );
+        let requests = server.join().unwrap().to_ascii_lowercase();
+        assert!(requests.contains(authorization));
+        if name == "glm" {
+            assert!(
+                requests.contains("get /api/biz/customer-package-reset/list?targettype=personal")
+            );
+            assert!(requests.contains("authorization: bearer synthetic-fixture-token"));
+            assert_eq!(result["reset_credits"]["known"], false);
+        } else if name == "claude" {
+            assert!(requests.contains("get /quota?cedar_ember=1 "));
+        }
     }
 }
 
@@ -203,16 +220,26 @@ async fn supplied_parsers_reject_invalid_provider_data() {
 async fn opencode_go_filter(body: &str) -> (bool, Value) {
     let assets = exported_assets();
     let directory = assets.path().join("assets/collectors");
+    collector_filter(&directory, "opencode-go", body).await
+}
+
+/// Runs a shipped jq parser on synthetic input, including GLM's two-document input.
+async fn collector_filter(directory: &std::path::Path, name: &str, body: &str) -> (bool, Value) {
     let mut child = tokio::process::Command::new("jq")
         .args(["-c", "-e", "-L"])
-        .arg(&directory)
+        .arg(directory)
+        .args(if name == "glm-credits" {
+            &["-s"][..]
+        } else {
+            &[]
+        })
         .args([
             "--argjson",
             "ctx",
             r#"{"models":{"deepseek":{},"muse":{}},"now":1000}"#,
             "-f",
         ])
-        .arg(directory.join("opencode-go.jq"))
+        .arg(directory.join(format!("{name}.jq")))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -232,6 +259,89 @@ async fn opencode_go_filter(body: &str) -> (bool, Value) {
         .unwrap();
     let value = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
     (output.status.success(), value)
+}
+
+/// Optional inventories preserve quota windows across absent, malformed and empty data.
+#[tokio::test]
+async fn reset_credit_fixtures_preserve_known_zero_and_provider_fields() {
+    let assets = exported_assets();
+    let directory = assets.path().join("assets/collectors");
+    for (name, base, key, present, empty) in [
+        (
+            "claude",
+            json!({"limits":[{"kind":"session","percent":25}]}),
+            "cedar_ember",
+            json!({"grants":[{"id":"fixture-credit","label":"Fixture credit","resets_left":2,
+                "usable_now":true,"clears":["session","weekly_all"],"starts_at":"1970-01-01T00:10:00Z",
+                "ends_at":"1970-01-01T01:00:00Z"}]}),
+            json!({"grants":[]}),
+        ),
+        (
+            "codex",
+            json!({"rateLimits":{"primary":{"usedPercent":25,"windowDurationMins":300}}}),
+            "rateLimitResetCredits",
+            json!({"availableCount":2,"credits":[{"id":"fixture-credit","resetType":"FIVE_HOUR","status":"available",
+                "title":"Fixture credit","grantedAt":600,"expiresAt":3600}]}),
+            json!({"credits":[]}),
+        ),
+        (
+            "glm-credits",
+            json!({"version":1,"windows":[{"window":"five_hour"}]}),
+            "data",
+            json!({"fiveHourResets":[{"recordId":"fixture-credit","grantType":"PACKAGE","available":true,
+                "packageName":"Fixture credit","expireTime":"1970-01-01 01:00:00"}],"weekResets":[]}),
+            json!({"fiveHourResets":[],"weekResets":[]}),
+        ),
+    ] {
+        for (payload, count) in [
+            (None, None),
+            (Some(json!("invalid")), None),
+            (Some(empty), Some(0)),
+            (
+                Some(present),
+                Some(if name == "glm-credits" { 1 } else { 2 }),
+            ),
+        ] {
+            let mut document = if name == "glm-credits" {
+                json!({"success":true,"code":0})
+            } else {
+                base.clone()
+            };
+            if let Some(payload) = payload {
+                document[key] = payload;
+            }
+            let input = if name == "glm-credits" {
+                format!("{base}\n{document}")
+            } else {
+                document.to_string()
+            };
+            let (ok, result) = collector_filter(&directory, name, &input).await;
+            assert!(ok, "{name}: {input}");
+            assert_eq!(result["windows"].as_array().unwrap().len(), 1);
+            let credits = &result["reset_credits"];
+            assert_eq!(credits["known"], count.is_some(), "{name}: {input}");
+            assert_eq!(credits["available_count"], json!(count), "{name}: {input}");
+            if count.is_some_and(|value| value > 0) {
+                let credit = &credits["credits"][0];
+                assert_eq!(credit["id"], "fixture-credit");
+                assert_eq!(credit["label"], "Fixture credit");
+                assert_eq!(credit["expires_at"], 3600);
+                assert_eq!(credit["usable_now"], true);
+                assert_eq!(
+                    credit["scope"],
+                    if name == "claude" { "all" } else { "five_hour" }
+                );
+            } else {
+                assert_eq!(credits["credits"], json!([]));
+            }
+        }
+    }
+    let (ok, result) = collector_filter(&directory, "codex", r#"{"rateLimits":{"primary":{"usedPercent":25,"windowDurationMins":300}},"rate_limit_reset_credits":{"available_count":3}}"#).await;
+    assert!(ok);
+    assert_eq!(
+        result["reset_credits"],
+        json!({"known":true,"available_count":3,"credits":[]})
+    );
 }
 
 /// Builds an OpenCode Go usage body from per-window (status, percent) JSON fragments.
@@ -375,4 +485,34 @@ async fn opencode_go_fails_closed_on_unauthorized() {
     assert!(output.stdout.is_empty());
     assert!(!String::from_utf8_lossy(&output.stderr).contains("synthetic-fixture-token"));
     server.join().unwrap();
+}
+
+/// Live-shaped Claude grants map extra clear targets and reject an ineligible surface.
+#[tokio::test]
+async fn claude_reset_grants_follow_live_shape() {
+    let assets = exported_assets();
+    let directory = assets.path().join("assets/collectors");
+    let grant = |clears: Value| {
+        json!({"id":"full-reset","label":"One full limit reset","type":"full","clears":clears,
+            "resets_left":1,"resets_total":1,"usable_now":true,"unavailable_reason":null,
+            "starts_at":"1970-01-01T00:10:00+00:00","ends_at":"1970-01-01T01:00:00+00:00"})
+    };
+    let body = json!({"limits":[{"kind":"session","percent":25}],"cedar_ember":{"eligible":true,
+        "grants":[grant(json!(["five_hour","seven_day","seven_day_overage_included"])),
+                  grant(json!(["five_hour","seven_day_overage_included"]))]}});
+    let (ok, result) = collector_filter(&directory, "claude", &body.to_string()).await;
+    assert!(ok);
+    let credits = &result["reset_credits"];
+    assert_eq!(credits["known"], true);
+    assert_eq!(credits["available_count"], 2);
+    assert_eq!(credits["credits"][0]["scope"], "all");
+    assert_eq!(credits["credits"][0]["provider_kind"], "full");
+    assert_eq!(credits["credits"][1]["scope"], "five_hour");
+
+    let ineligible = json!({"limits":[{"kind":"session","percent":25}],
+        "cedar_ember":{"eligible":false,"ineligible_reason":"surface","grants":[]}});
+    let (ok, result) = collector_filter(&directory, "claude", &ineligible.to_string()).await;
+    assert!(ok);
+    assert_eq!(result["reset_credits"]["known"], false);
+    assert_eq!(result["windows"].as_array().unwrap().len(), 1);
 }

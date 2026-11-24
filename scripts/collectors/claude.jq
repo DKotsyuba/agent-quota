@@ -14,7 +14,27 @@ def scoped($models):
       . as $name | (tokens) as $parts
       | select($name == $scope.id or (($wanted | length) > 0 and (($wanted - $parts) | length) == 0))]};
 
+# Preserve the grant inventory and count only uses the provider marks usable now.
+def claude_credits:
+  try (
+    .cedar_ember
+    | if .eligible == false then error("ineligible reset surface") else . end
+    | .grants | credit_rows
+    | map(
+        (.clears // [] | map(credit_scope) | map(select(. != "unknown")) | unique) as $scopes
+        | {id:(.id | credit_text(128)), provider_kind:((.type // "GRANT") | credit_text(64)),
+           label:((.label // "Banked Reset Credit") | credit_text(128)),
+           scope:(if $scopes == ["five_hour","seven_day"] then "all"
+                  elif ($scopes | length) == 1 then $scopes[0] else "unknown" end),
+           resets_left:(.resets_left | credit_count),
+           usable_now:(.usable_now | if type == "boolean" then . else error("invalid usable flag") end),
+           granted_at:(.starts_at | credit_time), expires_at:(.ends_at | credit_time)}
+      )
+    | {known:true, available_count:((map(select(.usable_now).resets_left) | add // 0) | credit_count), credits:.}
+  ) catch unknown_credits;
+
 # Only limits[] is authoritative here; parallel summary objects are not added twice.
+. as $response |
 .limits
 | if type != "array" then error("missing usage limits") else . end
 | [ .[] | . as $entry
@@ -29,4 +49,4 @@ def scoped($models):
     | ($entry.resets_at | reset) as $reset
     | select(($window.models | length) > 0)
     | $window + {remaining_percent:(100-$used), reset_at:$reset, observed_at:$ctx.now}
-  ] | envelope
+  ] | envelope | .reset_credits = ($response | claude_credits)

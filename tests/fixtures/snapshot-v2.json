@@ -49,6 +49,7 @@
         "known":true, "remaining_percent":80.0, "reset_at":20000.0, "warmup":true,
         "risk":"low", "recommendations":[]
       }],
+      "reset_credits":{"known":true,"available_count":2,"observed_at":10000.0,"credits":[{"id":"fixture-credit","provider_kind":"FIVE_HOUR","label":"Fixture credit","scope":"five_hour","resets_left":null,"usable_now":true,"granted_at":600.0,"expires_at":36000.0}]},
       "advice_key":"a5d72fa34c2aac10ab60685606589c56"
     }]
   }

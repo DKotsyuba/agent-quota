@@ -63,6 +63,12 @@ const ASSETS: &[Asset] = &[
     },
     Asset {
         directory: "collectors",
+        name: "glm-credits.jq",
+        bytes: include_bytes!("../scripts/collectors/glm-credits.jq"),
+        executable: false,
+    },
+    Asset {
+        directory: "collectors",
         name: "opencode-go.sh",
         bytes: include_bytes!("../scripts/collectors/opencode-go.sh"),
         executable: true,
