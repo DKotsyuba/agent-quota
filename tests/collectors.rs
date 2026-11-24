@@ -516,3 +516,14 @@ async fn claude_reset_grants_follow_live_shape() {
     assert_eq!(result["reset_credits"]["known"], false);
     assert_eq!(result["windows"].as_array().unwrap().len(), 1);
 }
+
+/// Codex full resets refill both the five-hour and weekly windows.
+#[tokio::test]
+async fn codex_rate_limit_credits_cover_all_windows() {
+    let assets = exported_assets();
+    let directory = assets.path().join("assets/collectors");
+    let body = r#"{"rateLimits":{"primary":{"usedPercent":25,"windowDurationMins":300}},"rateLimitResetCredits":{"availableCount":1,"credits":[{"id":"c1","resetType":"codexRateLimits","status":"available","title":"Full reset","grantedAt":600,"expiresAt":3600}]}}"#;
+    let (ok, result) = collector_filter(&directory, "codex", body).await;
+    assert!(ok);
+    assert_eq!(result["reset_credits"]["credits"][0]["scope"], "all");
+}

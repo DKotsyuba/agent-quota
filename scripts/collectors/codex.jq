@@ -14,7 +14,8 @@ def codex_credits:
         (.resetType // .reset_type // "unknown") as $kind
         | (.status // .state // "" | ascii_downcase) as $status
         | {id:((.id // .creditId // .credit_id) | credit_text(128)),
-           provider_kind:($kind | credit_text(64)), scope:($kind | credit_scope),
+           provider_kind:($kind | credit_text(64)),
+           scope:(if ($kind | ascii_downcase | gsub("[^a-z]"; "")) == "codexratelimits" then "all" else ($kind | credit_scope) end),
            label:((.title // "Banked Reset Credit") | credit_text(128)), resets_left:null,
            usable_now:(if $status == "available" then true
                        elif (["pending","consumed","redeeming","redeemed","used","expired","unavailable"] | index($status)) != null then false

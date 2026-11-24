@@ -41,7 +41,7 @@ pub(crate) struct OAuthState {
     pub expires_at_ms: Option<i64>,
     /// Whether the store also holds a refresh token that its own CLI could use.
     pub refreshable: bool,
-    /// The CLI's OAuth document identifies a personal subscription without remote policy.
+    /// The CLI's OAuth document identifies a Pro, Max or Team subscription login without an API key.
     pub personal_subscription: bool,
 }
 
@@ -483,7 +483,7 @@ fn oauth_document(document: &str) -> Option<(String, OAuthState)> {
             .is_some_and(|refresh| !refresh.is_empty()),
         personal_subscription: matches!(
             oauth.get("subscriptionType").and_then(Value::as_str),
-            Some("pro" | "max")
+            Some("pro" | "max" | "team")
         ) && ["gatewayToken", "primaryApiKey"]
             .iter()
             .all(|name| value.get(name).is_none_or(Value::is_null)),

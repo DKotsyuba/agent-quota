@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 0.2.4
+
+Dated 2026-11-24.
+
+### Fixed
+
+- Claude OAuth renewal accepts Team subscription logins as well as Pro and Max; Enterprise logins remain refused. A Team login previously failed with `credential_refresh_unsupported_host` once its access token expired, leaving Claude quota unknown.
+- Codex reset credits of kind `codexRateLimits` (full reset of the 5-hour and weekly windows) report scope `all` instead of `unknown`.
+
 ## 0.2.3
 
 Dated 2026-11-24.
