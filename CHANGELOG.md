@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.3.0
+
+Dated 2026-11-24.
+
 ### Added
 
 - Owner-requested redemption of one banked reset credit for Claude, Codex and GLM. New socket methods `redeem_reset_credit` and `redeem_status` are idempotent per client `request_id` and are open only to UIDs named by the new `serve --allow-redeem-uid` flag (default none). `agent-quota redeem` is their CLI client. They are not MCP tools.
