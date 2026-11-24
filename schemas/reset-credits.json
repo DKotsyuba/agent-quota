@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Account reset credits in a quota snapshot",
+  "allOf": [{"$ref": "#/$defs/inventory"}],
+  "properties": {
+    "observed_at": {"type": ["number", "null"], "minimum": 0}
+  },
+  "required": ["observed_at", "available_count"],
+  "if": {"properties": {"known": {"const": true}}},
+  "then": {"properties": {"observed_at": {"type": "number"}}},
+  "unevaluatedProperties": false,
+  "$defs": {
+    "collector": {
+      "title": "Optional reset_credits object in version-1 collector output",
+      "allOf": [{"$ref": "#/$defs/inventory"}],
+      "unevaluatedProperties": false
+    },
+    "inventory": {
+      "type": "object",
+      "required": ["known", "credits"],
+      "properties": {
+        "known": {"type": "boolean"},
+        "available_count": {"$ref": "#/$defs/count"},
+        "credits": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {"$ref": "#/$defs/credit"}
+        }
+      },
+      "if": {"properties": {"known": {"const": false}}},
+      "then": {
+        "properties": {
+          "available_count": {"type": "null"},
+          "credits": {"maxItems": 0}
+        }
+      }
+    },
+    "credit": {
+      "type": "object",
+      "required": ["id", "provider_kind", "label", "scope"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "provider_kind": {"type": "string", "minLength": 1, "maxLength": 64},
+        "label": {"type": "string", "minLength": 1, "maxLength": 128},
+        "scope": {"type": "string", "maxLength": 128, "pattern": "^(five_hour|seven_day|all|unknown|model:.+)$"},
+        "resets_left": {"$ref": "#/$defs/count"},
+        "usable_now": {"type": ["boolean", "null"]},
+        "granted_at": {"$ref": "#/$defs/time"},
+        "expires_at": {"$ref": "#/$defs/time"}
+      }
+    },
+    "count": {"type": ["integer", "null"], "minimum": 0, "maximum": 4294967295},
+    "time": {"type": ["number", "null"], "minimum": 0, "maximum": 253402300799}
+  }
+}

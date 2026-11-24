@@ -59,6 +59,25 @@ and `last_reset_at` are nullable raw facts from the latest sample and remain
 available when that sample is stale; they do not establish freshness.
 Timestamps are Unix seconds; nullable values remain unknown, not zero. Active latches are independent of
 sample freshness. Advice and its noise-tolerant key are returned per account.
+
+Each account also includes [`reset_credits`](../schemas/reset-credits.json).
+`known: false` means the inventory is unavailable, with a null count and no
+rows. A known zero is an explicit `available_count: 0`. A provider can report a
+count without listing individual credits, or return rows without a usable
+count. `observed_at` gives the Unix time of the last credit observation and is
+null before any observation. The service stores one latest observation per
+account. Counts and per-credit availability describe that observation.
+Account-level credit information is included with model-filtered reads.
+
+Version-1 collector output accepts an optional
+[`reset_credits` object](../schemas/reset-credits.json#/$defs/collector).
+Older collectors can omit the field. An omission supplies no credit observation,
+so availability stays unknown until a collector reports an inventory.
+A credit contains its provider ID and kind, label, scope,
+nullable resets remaining and usability, and nullable grant and expiry times
+in Unix seconds. The contract permits up to 64 rows. The service bounds text
+fields in UTF-8 bytes (128 for ID, label and scope, and 64 for provider kind).
+
 The normal collector and external-ingest paths require `observed_at` and supply
 `valid_until` when omitted. An unsupported manually written or legacy row that
 lacks either bound is not reported as a fresh known forecast; its raw last value
@@ -115,8 +134,9 @@ and retained histories over 50,000 rows per account instead of silently cutting
 them. Narrow the account/model scope when `response_too_large` is returned;
 `history_too_large` requires operator attention. One absolute five-second I/O
 deadline applies to each socket exchange. The CLI `limits` prints the same
-snapshot JSON; MCP `get_quota` renders at most 20 model rows and asks for a
-narrower scope rather than omitting rows. The CLI `capacity` prints the capacity
+snapshot JSON. MCP `get_quota` renders up to 20 model rows, 20 account credit
+summaries, and 20 credit rows within its 8 KiB text budget. An oversized result
+requires a narrower account or model scope. The CLI `capacity` prints the capacity
 JSON; MCP `get_capacity` renders at most 60 model rows on the same terms.
 
 ## Capacity order

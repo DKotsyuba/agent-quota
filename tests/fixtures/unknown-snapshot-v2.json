@@ -26,7 +26,7 @@
         "reset_at":null, "risk":"unknown", "evidence":"missing", "newest_observed_at":null,
         "exhausted_until":null, "pools":[]
       }],
-      "windows":[], "latches":[], "advice":[], "advice_key":"e3b0c44298fc1c149afbf4c8996fb924"
+      "windows":[], "latches":[], "advice":[], "reset_credits":{"known":false,"available_count":null,"observed_at":null,"credits":[]}, "advice_key":"e3b0c44298fc1c149afbf4c8996fb924"
     }]
   }
 }

@@ -50,7 +50,7 @@
         "known":true, "remaining_percent":0.0, "reset_at":20000.0, "warmup":false, "risk":"high",
         "recommendations":["acct-test/primary five_hour source=fixture-source is near exhaustion; avoid starting new primary work before reset."]
       }],
-      "advice_key":"24ab79806b5c1832b5aae5f5fbc72c1d"
+      "reset_credits":{"known":false,"available_count":null,"observed_at":10001.0,"credits":[]}, "advice_key":"24ab79806b5c1832b5aae5f5fbc72c1d"
     }]
   }
 }

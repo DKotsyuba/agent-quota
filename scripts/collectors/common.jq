@@ -22,3 +22,30 @@ def reset:
 # Require at least one window and wrap it in the public collector output contract.
 def envelope:
   if length == 0 then error("no applicable quota windows") else {version:1, windows:.} end;
+
+# Bounds shared by the normalized credit contract.
+def credit_count:
+  if type == "number" and . >= 0 and . <= 4294967295 and . == floor then .
+  else error("invalid credit count") end;
+def credit_text($max):
+  if type == "string" and test("\\S") and utf8bytelength <= $max
+     and (test("[\\p{Cc}]") | not) then . else error("invalid credit text") end;
+def credit_rows:
+  if type == "array" and length <= 64 then . else error("invalid credit rows") end;
+
+# Accept ISO timestamps and Unix seconds or milliseconds where providers use numbers.
+def credit_time:
+  if type == "number" then (if . > 253402300799 then . / 1000 else . end)
+  else reset end
+  | if . == null or (. >= 0 and . <= 253402300799) then . else error("invalid credit time") end;
+
+def credit_scope:
+  if type != "string" then "unknown"
+  elif test("^model:.*\\S") then (try credit_text(128) catch "unknown")
+  else ascii_downcase
+  | if . == "session" or . == "five_hour" then "five_hour"
+    elif . == "week" or . == "weekly" or . == "weekly_all" or . == "seven_day" then "seven_day"
+    elif . == "all" then "all" else "unknown" end
+  end;
+
+def unknown_credits: {known:false, available_count:null, credits:[]};

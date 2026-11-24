@@ -126,7 +126,7 @@ cat >/dev/null
 remaining=$((100 - n * 10))
 if [ "$remaining" -lt 0 ]; then remaining=0; fi
 observed=$(date +%s)
-printf '{"version":1,"windows":[{"pool":"primary","window":"five_hour","models":["model-a"],"remaining_percent":%s,"observed_at":%s,"valid_until":4000000000,"reset_at":4000000000}]}' "$remaining" "$observed"
+printf '{"version":1,"windows":[{"pool":"primary","window":"five_hour","models":["model-a"],"remaining_percent":%s,"observed_at":%s,"valid_until":4000000000,"reset_at":4000000000}],"reset_credits":{"known":true,"available_count":2,"credits":[{"id":"fixture-credit","provider_kind":"FIVE_HOUR","label":"Fixture credit","scope":"five_hour","resets_left":null,"usable_now":true,"granted_at":null,"expires_at":4000000000}]}}' "$remaining" "$observed"
 "#,
     );
     std::fs::write(
@@ -196,6 +196,10 @@ source = "fixture-source"
         "model-a"
     );
     assert_eq!(second["result"]["coverage"]["state"], "complete");
+    assert_eq!(
+        second["result"]["accounts"][0]["reset_credits"]["available_count"],
+        2
+    );
     let output = Command::new(binary())
         .arg("limits")
         .arg("--socket")
@@ -210,6 +214,11 @@ source = "fixture-source"
     assert!(output.status.success());
     let cli: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(cli["accounts"][0]["models"][0]["state"], "known");
+    let credits = &cli["accounts"][0]["reset_credits"];
+    assert_eq!(credits["known"], true);
+    assert_eq!(credits["available_count"], 2);
+    assert_eq!(credits["credits"][0]["id"], "fixture-credit");
+    assert!(credits["observed_at"].is_number());
     let invalid = Command::new(binary())
         .arg("limits")
         .arg("--socket")
@@ -239,12 +248,10 @@ source = "fixture-source"
         .unwrap();
     let wire = serde_json::to_value(reply).unwrap();
     assert_eq!(wire["isError"], false, "{wire}");
-    assert!(
-        wire["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("model-a")
-    );
+    let text = wire["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("model-a"));
+    assert!(text.contains("reset credits: known | available count: 2"));
+    assert!(text.contains("\"fixture-credit\""));
     let capacity = client
         .call_tool(CallToolRequestParams::new("get_capacity"))
         .await

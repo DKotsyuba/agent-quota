@@ -456,6 +456,7 @@ mod tests {
         let config = QuotaConfig::parse(&text).unwrap();
         let account: AccountId = "acct".parse().unwrap();
         let mut history = AccountQuotaHistory {
+            reset_credits: Default::default(),
             revision: 1,
             windows: vec![StoredWindow {
                 id: 1,
@@ -532,6 +533,7 @@ mod tests {
             models: Some(BTreeSet::from(["a".into()])),
         };
         let mut history = AccountQuotaHistory {
+            reset_credits: Default::default(),
             revision: 1,
             windows: vec![
                 window("limiting", 20.0, 600.0, Some(1000.0)),
@@ -632,6 +634,7 @@ mod tests {
             models: Some(BTreeSet::from(["a".into()])),
         };
         let history = AccountQuotaHistory {
+            reset_credits: Default::default(),
             revision: 1,
             windows: vec![window(2, 40.0, 10000.0), window(1, 100.0, 6400.0)],
             latches: vec![],
@@ -733,6 +736,7 @@ mod tests {
         let account: AccountId = "acct".parse().unwrap();
         let reset = f64::from_bits(1);
         let history = AccountQuotaHistory {
+            reset_credits: Default::default(),
             revision: 1,
             windows: vec![StoredWindow {
                 id: 1,
@@ -786,6 +790,7 @@ mod tests {
             models: Some(BTreeSet::from(["a".into()])),
         };
         let history = AccountQuotaHistory {
+            reset_credits: Default::default(),
             revision: 1,
             windows: vec![
                 window(3, "early", 50.0, 10000.0, 11800.0),
@@ -981,6 +986,7 @@ binary = "/bin/true"
         let config = QuotaConfig::parse(&text).unwrap();
         let account: AccountId = "acct".parse().unwrap();
         let history = AccountQuotaHistory {
+            reset_credits: Default::default(),
             revision: 0,
             windows: Vec::new(),
             latches: Vec::new(),
@@ -1171,7 +1177,10 @@ source = "fixture-source"
             source: "fixture-source".into(),
             models: BTreeSet::from(["model-a".into()]),
         };
-        let raw = json!({"version":1,"windows":[{"pool":"primary","window":"five_hour",
+        let raw = json!({"version":1,"reset_credits":{"known":true,"available_count":2,"credits":[{
+            "id":"fixture-credit","provider_kind":"FIVE_HOUR","label":"Fixture credit","scope":"five_hour",
+            "resets_left":null,"usable_now":true,"granted_at":600,"expires_at":36000
+        }]},"windows":[{"pool":"primary","window":"five_hour",
             "models":["model-a"],"remaining_percent":80,"observed_at":10000,
             "valid_until":10900,"reset_at":20000}]});
         let snapshot =
@@ -1207,7 +1216,8 @@ source = "fixture-source"
         let expected: Value =
             serde_json::from_str(include_str!("../tests/fixtures/snapshot-v2.json")).unwrap();
         assert_eq!(json!({"version":1,"result":result}), expected);
-        let zero = json!({"version":1,"windows":[{"pool":"primary","window":"five_hour",
+        let zero = json!({"version":1,"reset_credits":{"known":false,"available_count":null,"credits":[]},
+            "windows":[{"pool":"primary","window":"five_hour",
             "models":["model-a"],"remaining_percent":0,"observed_at":10001,
             "valid_until":10901,"reset_at":20000}]});
         let zero = normalize_collector_output(&account, &scope, &zero, 10001.0, 256, 256).unwrap();
@@ -1396,6 +1406,7 @@ struct LatchView {
 /// A bounded account response, with physical windows emitted once rather than per alias.
 #[derive(Serialize)]
 struct AccountView {
+    reset_credits: crate::quota::ResetCreditSnapshot,
     account: String,
     models: Vec<ModelView>,
     windows: Vec<WindowView>,
@@ -1766,6 +1777,7 @@ fn account_view(
     let advice = advice::build_advice(&forecasts);
     let advice_key = advice::advice_key(&advice);
     Ok(AccountView {
+        reset_credits: history.reset_credits,
         account: account.as_str().to_owned(),
         models,
         windows,
