@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.2.3
+
+Dated 2026-11-24.
+
 ### Added
 
 - Collect banked reset credits for Claude, Codex and GLM. Account results in CLI `limits`, IPC snapshots and MCP `get_quota` expose the latest observed inventory and distinguish unknown availability from zero.
