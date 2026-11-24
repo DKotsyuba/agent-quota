@@ -121,7 +121,7 @@ executing user:
 ```
 
 The supported profile is the official Claude Code **2.1.322** executable and an
-unmanaged personal Pro or Max OAuth login on native Linux. Quota probes the
+unmanaged Pro, Max or Team OAuth login on native Linux (Enterprise logins are refused). Quota probes the
 exact version with private bounded stdout and without the login environment.
 Managed settings take precedence over the hook flag, and a managed MCP file
 conflicts with strict MCP configuration. Quota checks for `managed-settings.json`,

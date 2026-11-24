@@ -309,6 +309,20 @@ async fn due_login_is_renewed_by_one_isolated_cli_turn() {
 }
 
 /// Exercises the cache exception through the full synthetic renewal path.
+/// Team subscription logins renew through the same isolated turn as Pro and Max.
+#[tokio::test]
+async fn team_subscription_login_is_renewed() {
+    let fixture = Fixture::new(true);
+    fixture.store(299, true);
+    let path = fixture.login.join(".credentials.json");
+    let team = std::fs::read_to_string(&path)
+        .unwrap()
+        .replace(r#""max""#, r#""team""#);
+    std::fs::write(&path, team).unwrap();
+    fixture.mode("renew", 28_800);
+    assert_eq!(fixture.renew().await, Ok(Renewal::Renewed));
+}
+
 #[tokio::test]
 async fn benign_remote_settings_cache_allows_renewal() {
     let fixture = Fixture::new(true);
@@ -473,7 +487,7 @@ async fn managed_hooks_mcp_and_alternate_profile_refuse_launch() {
     std::fs::remove_dir(&profile).unwrap();
     std::fs::write(
         fixture.login.join(".credentials.json"),
-        document("canary", 120, true).replace(r#""max""#, r#""team""#),
+        document("canary", 120, true).replace(r#""max""#, r#""enterprise""#),
     )
     .unwrap();
     assert_eq!(
