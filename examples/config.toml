@@ -62,6 +62,13 @@ timeout_seconds = 30
 # args = ["/ABSOLUTE/PRIVATE/PARENT/quota-assets/collectors/claude.sh"]
 # source = "claude-oauth-usage"
 # timeout_seconds = 30
+#
+# Optional, only with execution = "external": let an authorized owner redeem a
+# banked reset credit (docs/configuration.md#reset-credit-redemption).
+# [sources.redeem]
+# command = "/bin/bash"
+# args = ["/ABSOLUTE/PRIVATE/PARENT/quota-assets/collectors/claude-redeem.sh"]
+# instance = "LAUNCHER-INSTANCE"
 
 # Optional capacity ranking weights (defaults 1.0; see docs/configuration.md):
 # put `priority_multiplier = 2.0` inside a [[sources]] entry for an account weight, and

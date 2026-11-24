@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-quota.invalid/schemas/redeem.json",
+  "title": "agent-quota reset-credit redemption (protocol version 1)",
+  "description": "One newline-terminated JSON request and one reply per Unix socket connection. Only UIDs named by `serve --allow-redeem-uid` may send these two methods.",
+  "$defs": {
+    "request_id": {
+      "description": "Client-chosen canonical lowercase version-4 UUID; the idempotency key.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "redeem_reset_credit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "method", "account", "credit_id", "request_id"],
+      "properties": {
+        "version": { "const": 1 },
+        "method": { "const": "redeem_reset_credit", "description": "The key `op` is accepted instead of `method`." },
+        "account": { "type": "string", "minLength": 1, "maxLength": 96 },
+        "credit_id": { "type": "string", "minLength": 1, "maxLength": 128, "description": "`id` of a row in the account's `reset_credits.credits`." },
+        "request_id": { "$ref": "#/$defs/request_id" }
+      }
+    },
+    "redeem_status": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "method", "request_id"],
+      "properties": {
+        "version": { "const": 1 },
+        "method": { "const": "redeem_status", "description": "The key `op` is accepted instead of `method`." },
+        "request_id": { "$ref": "#/$defs/request_id" }
+      }
+    },
+    "record": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["request_id", "account", "credit_id", "state", "reason", "created_at", "updated_at"],
+      "properties": {
+        "request_id": { "$ref": "#/$defs/request_id" },
+        "account": { "type": "string" },
+        "credit_id": { "type": "string" },
+        "state": { "enum": ["pending", "redeemed", "rejected", "unknown", "failed"] },
+        "reason": { "type": ["string", "null"], "pattern": "^[a-z0-9_]{1,64}$" },
+        "created_at": { "type": "integer", "minimum": 0, "description": "Unix seconds." },
+        "updated_at": { "type": "integer", "minimum": 0, "description": "Unix seconds of the latest state change." }
+      }
+    },
+    "reply": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["version", "result"],
+          "properties": { "version": { "const": 1 }, "result": { "$ref": "#/$defs/record" } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["version", "error"],
+          "properties": {
+            "version": { "const": 1 },
+            "error": {
+              "enum": [
+                "unauthorized", "invalid_request", "unsupported_version", "unsupported_method",
+                "unknown_account", "unknown_request", "request_conflict", "storage_error",
+                "internal_error", "busy", "unavailable"
+              ]
+            }
+          }
+        }
+      ]
+    }
+  },
+  "oneOf": [
+    { "$ref": "#/$defs/redeem_reset_credit" },
+    { "$ref": "#/$defs/redeem_status" }
+  ]
+}

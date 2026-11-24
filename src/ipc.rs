@@ -1,4 +1,5 @@
-//! Bounded, read-only local IPC authenticated by operating-system credentials.
+//! Bounded local IPC authenticated by operating-system credentials. Reads are open to
+//! allowed peers; ingestion, redemption requests and launcher steps have their own grants.
 //!
 //! The socket directory and service UID are trusted administration boundaries.
 //! Callers must signal shutdown and await `serve`; dropping its future is not a
@@ -32,10 +33,12 @@ const DEADLINE: Duration = Duration::from_secs(5);
 static NEXT_STAGE: AtomicU64 = AtomicU64::new(0);
 
 /// One protocol-v1 request; empty snapshot scope means all configured accounts.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Request {
     pub version: u8,
+    /// `op` is accepted as an alias of this key.
+    #[serde(alias = "op")]
     pub method: String,
     #[serde(default)]
     pub accounts: Vec<String>,
@@ -43,6 +46,58 @@ pub(crate) struct Request {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observation: Option<Value>,
+    /// Redemption target account, or the account whose request a launcher claims.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// Inventory credit to redeem.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credit_id: Option<String>,
+    /// Client-chosen version-4 UUID that makes a redemption request idempotent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    /// Executor verdict submitted by the owner-only `redeem_report`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<Value>,
+}
+
+impl Request {
+    /// True when none of the redemption-only fields is present.
+    fn plain(&self) -> bool {
+        self.account.is_none()
+            && self.credit_id.is_none()
+            && self.request_id.is_none()
+            && self.outcome.is_none()
+    }
+
+    /// True when no read or ingest field is present.
+    fn unscoped(&self) -> bool {
+        self.accounts.is_empty() && self.model.is_none() && self.observation.is_none()
+    }
+}
+
+/// Bounds an identifier field before the application interprets it.
+fn short_text(value: &Option<String>) -> bool {
+    value.as_ref().is_some_and(|text| {
+        !text.is_empty() && text.len() <= 128 && !text.chars().any(char::is_control)
+    })
+}
+
+/// Methods restricted to UIDs named by `--allow-redeem-uid`.
+fn redeem_method(method: &str) -> bool {
+    matches!(method, "redeem_reset_credit" | "redeem_status")
+}
+
+/// Methods restricted to the service's own UID, like `ingest`.
+fn owner_method(method: &str) -> bool {
+    matches!(method, "ingest" | "redeem_claim" | "redeem_report")
+}
+
+/// Methods that can change state, so a lost reply leaves the outcome unknown.
+fn mutating_method(method: &str) -> bool {
+    matches!(
+        method,
+        "ingest" | "redeem_reset_credit" | "redeem_claim" | "redeem_report"
+    )
 }
 
 /// Exactly one result or fixed safe error; clients additionally validate version.
@@ -102,6 +157,8 @@ fn safe_error(code: &str) -> bool {
             | "invalid_observation"
             | "unsupported_source"
             | "outcome_unknown"
+            | "unknown_request"
+            | "request_conflict"
     )
 }
 
@@ -109,6 +166,49 @@ fn safe_error(code: &str) -> bool {
 fn validate_request(request: &Request) -> Result<(), &'static str> {
     if request.version != 1 {
         return Err("unsupported_version");
+    }
+    match request.method.as_str() {
+        "redeem_reset_credit"
+            if request.unscoped()
+                && request.outcome.is_none()
+                && short_text(&request.account)
+                && short_text(&request.credit_id)
+                && short_text(&request.request_id) =>
+        {
+            return Ok(());
+        }
+        "redeem_status"
+            if request.unscoped()
+                && request.outcome.is_none()
+                && request.account.is_none()
+                && request.credit_id.is_none()
+                && short_text(&request.request_id) =>
+        {
+            return Ok(());
+        }
+        "redeem_claim"
+            if request.unscoped()
+                && request.outcome.is_none()
+                && request.credit_id.is_none()
+                && request.request_id.is_none()
+                && short_text(&request.account) =>
+        {
+            return Ok(());
+        }
+        "redeem_report"
+            if request.unscoped()
+                && request.account.is_none()
+                && request.credit_id.is_none()
+                && request.request_id.is_none()
+                && request.outcome.is_some() =>
+        {
+            return Ok(());
+        }
+        "redeem_reset_credit" | "redeem_status" | "redeem_claim" | "redeem_report" => {
+            return Err("invalid_request");
+        }
+        _ if !request.plain() => return Err("invalid_request"),
+        _ => {}
     }
     match request.method.as_str() {
         "status"
@@ -226,10 +326,10 @@ pub(crate) async fn request(
     expected_uid: u32,
 ) -> Result<Reply, String> {
     validate_request(req).map_err(str::to_owned)?;
-    let mutation = req.method == "ingest";
+    let mutation = mutating_method(&req.method);
     let bytes = encode(
         req,
-        if mutation {
+        if req.method == "ingest" {
             MAX_OWNER_REQUEST
         } else {
             MAX_REQUEST
@@ -474,6 +574,7 @@ async fn connection<F>(
     handler: Arc<F>,
     mut stop: watch::Receiver<bool>,
     is_owner: bool,
+    may_redeem: bool,
 ) -> Result<(), &'static str>
 where
     F: Fn(Request) -> Reply + Send + Sync + 'static,
@@ -492,7 +593,12 @@ where
                 Reply::error("invalid_request")
             }
             Ok(request) => match validate_request(&request) {
-                Ok(()) if request.method == "ingest" && !is_owner => Reply::error("unauthorized"),
+                Ok(()) if owner_method(&request.method) && !is_owner => {
+                    Reply::error("unauthorized")
+                }
+                Ok(()) if redeem_method(&request.method) && !may_redeem => {
+                    Reply::error("unauthorized")
+                }
                 Ok(()) => {
                     if Instant::now() >= deadline || *stop.borrow() {
                         return Ok(());
@@ -544,13 +650,16 @@ where
     F: Fn(Request) -> Reply + Send + Sync + 'static,
     S: Future<Output = ()> + Send,
 {
-    serve_inner(path, allowed_uids, handler, shutdown, None).await
+    serve_inner(path, allowed_uids, Vec::new(), handler, shutdown, None).await
 }
 
 /// Serves reads and reports readiness only after the owned socket is published.
+/// `redeem_uids` may additionally request and read reset-credit redemptions; they
+/// still need the owner UID or an `allowed_uids` entry to connect at all.
 pub(crate) async fn serve_ready<F, S>(
     path: &Path,
     allowed_uids: Vec<u32>,
+    redeem_uids: Vec<u32>,
     handler: F,
     shutdown: S,
     ready: oneshot::Sender<()>,
@@ -559,13 +668,22 @@ where
     F: Fn(Request) -> Reply + Send + Sync + 'static,
     S: Future<Output = ()> + Send,
 {
-    serve_inner(path, allowed_uids, handler, shutdown, Some(ready)).await
+    serve_inner(
+        path,
+        allowed_uids,
+        redeem_uids,
+        handler,
+        shutdown,
+        Some(ready),
+    )
+    .await
 }
 
 /// Owns the listener and every accepted handler until cooperative shutdown.
 async fn serve_inner<F, S>(
     path: &Path,
     allowed_uids: Vec<u32>,
+    redeem_uids: Vec<u32>,
     handler: F,
     shutdown: S,
     ready: Option<oneshot::Sender<()>>,
@@ -605,7 +723,7 @@ where
                 if connections.len() >= MAX_CONNECTIONS || !authorized(owner_uid(), &allowed_uids, peer.uid()) {
                     continue;
                 }
-                connections.spawn(connection(stream, Arc::clone(&handler), stop_rx.clone(), peer.uid() == owner_uid()));
+                connections.spawn(connection(stream, Arc::clone(&handler), stop_rx.clone(), peer.uid() == owner_uid(), redeem_uids.contains(&peer.uid())));
             },
         }
     }
@@ -737,6 +855,7 @@ mod tests {
                     accounts: accounts.clone(),
                     model: None,
                     observation: None,
+                    ..Default::default()
                 },
                 owner_uid(),
             )
@@ -756,6 +875,7 @@ mod tests {
             accounts: vec![],
             model: None,
             observation: None,
+            ..Default::default()
         };
         assert!(request(&path, &req, wrong_uid).await.is_err());
         assert_eq!(
@@ -769,6 +889,58 @@ mod tests {
         assert_eq!(fs::read_dir(dir.path()).expect("directory").count(), 1);
     }
 
+    /// Redemption methods need their own grant; launcher methods need the owner UID.
+    /// Being the owner or an allowlisted reader is not enough for either the other way.
+    #[tokio::test]
+    async fn redemption_methods_are_authorized_separately() {
+        let id = "11111111-1111-4111-8111-111111111111";
+        let request = |method: &str| match method {
+            "redeem_reset_credit" => serde_json::json!({"version":1,"method":method,
+                "account":"a","credit_id":"c","request_id":id}),
+            "redeem_status" => serde_json::json!({"version":1,"op":method,"request_id":id}),
+            "redeem_claim" => serde_json::json!({"version":1,"method":method,"account":"a"}),
+            _ => serde_json::json!({"version":1,"method":method,"outcome":{}}),
+        };
+        for (method, is_owner, may_redeem, allowed) in [
+            ("redeem_reset_credit", true, false, false),
+            ("redeem_reset_credit", false, true, true),
+            ("redeem_status", true, false, false),
+            ("redeem_status", false, true, true),
+            ("redeem_claim", false, true, false),
+            ("redeem_claim", true, false, true),
+            ("redeem_report", false, true, false),
+            ("redeem_report", true, false, true),
+        ] {
+            let (mut client, server) = UnixStream::pair().expect("socket pair");
+            let handler = Arc::new(|request: Request| Reply::ok(Value::String(request.method)));
+            let (_stop, receiver) = watch::channel(false);
+            let task = tokio::spawn(connection(server, handler, receiver, is_owner, may_redeem));
+            client
+                .write_all(format!("{}\n", request(method)).as_bytes())
+                .await
+                .expect("write");
+            let frame = read_frame(&mut client, MAX_REPLY).await.expect("reply");
+            let reply: Value = serde_json::from_slice(&frame).expect("reply JSON");
+            if allowed {
+                assert_eq!(reply["result"], method, "{method}");
+            } else {
+                assert_eq!(reply["error"], "unauthorized", "{method}");
+            }
+            task.await.expect("joined").expect("clean connection");
+        }
+        // Field sets are exact: redemption fields are refused on other methods and vice versa.
+        for bad in [
+            serde_json::json!({"version":1,"method":"snapshot","account":"a"}),
+            serde_json::json!({"version":1,"method":"redeem_status","request_id":id,"accounts":["a"]}),
+            serde_json::json!({"version":1,"method":"redeem_reset_credit","account":"a","request_id":id}),
+            serde_json::json!({"version":1,"method":"redeem_claim","account":""}),
+            serde_json::json!({"version":1,"method":"redeem_report"}),
+        ] {
+            let request: Request = serde_json::from_value(bad).expect("request shape");
+            assert_eq!(validate_request(&request), Err("invalid_request"));
+        }
+    }
+
     /// An authorized reader UID cannot invoke the owner-only ingestion path.
     #[tokio::test]
     async fn non_owner_ingestion_never_reaches_handler() {
@@ -780,13 +952,14 @@ mod tests {
             Reply::ok(Value::Null)
         });
         let (_stop, receiver) = watch::channel(false);
-        let task = tokio::spawn(connection(server, handler, receiver, false));
+        let task = tokio::spawn(connection(server, handler, receiver, false, false));
         let req = Request {
             version: 1,
             method: "ingest".into(),
             accounts: vec![],
             model: None,
             observation: Some(serde_json::json!({"version":1})),
+            ..Default::default()
         };
         client
             .write_all(&encode(&req, MAX_REQUEST).expect("request"))
@@ -820,6 +993,7 @@ mod tests {
             accounts: vec![],
             model: None,
             observation: Some(serde_json::json!({"version":1})),
+            ..Default::default()
         };
         assert!(
             matches!(request(&path, &req, owner_uid()).await, Err(code) if code == "outcome_unknown")
@@ -883,6 +1057,7 @@ mod tests {
             accounts: vec!["a".into(); 257],
             model: None,
             observation: None,
+            ..Default::default()
         };
         assert_eq!(
             raw(&path, &encode(&too_many, MAX_REQUEST).expect("encode")).await["error"],
@@ -1016,6 +1191,7 @@ mod tests {
             accounts: vec![],
             model: None,
             observation: None,
+            ..Default::default()
         };
         assert!(request(&path, &req, owner_uid()).await.is_err());
         assert_eq!(
@@ -1119,6 +1295,7 @@ mod tests {
                     accounts: vec![],
                     model: None,
                     observation: None,
+                    ..Default::default()
                 },
                 owner_uid(),
             )

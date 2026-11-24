@@ -65,6 +65,109 @@ idempotent receipt or a cross-process transaction. `KillMode=control-group`
 helps systemd stop its children; the real-child timeout and cgroup cleanup were
 observed on dobi (see below).
 
+## Reset-credit redemption
+
+The same launcher has a `redeem` mode for the owner-requested
+[redemption API](api.md#reset-credit-redemption). Its units,
+`agent-quota-owner-redeem@.path` and `agent-quota-owner-redeem@.service`, are also
+exported by `export-assets` and remain uninstalled examples. The path unit
+watches `/var/lib/agent-quota/redeem/<instance>.pending`, which the service
+writes inside its private home when it accepts a request. The service unit then
+runs, under the shared lock:
+
+1. `agent-quota redeem-claim` as the service user. The service repeats its
+   admission check, hands out the pending request once under a random claim
+   token, and removes the trigger. A request whose credit is no longer usable,
+   or whose inventory another redemption has overtaken, is rejected instead of
+   handed out. With nothing to hand out the run ends successfully.
+2. `agent-quota redeem-execute` as the credential owner, with the claim on
+   stdin. It refuses a claim admitted under other configuration bytes than the
+   file it reads (`owner_binding_changed`). It resolves the credential like `probe`, runs the source's
+   `[sources.redeem]` command once and prints a credential-free outcome that
+   repeats the claim token.
+3. `agent-quota redeem-report` as the service user. The same report is sent
+   again with backoff (eight attempts, about two minutes of waiting) until the
+   service accepts it. The service applies a report only to the claim whose
+   token it carries; the first verdict is final and a repetition has no effect.
+4. A normal `probe` and `ingest`, so the inventory is current again.
+
+The provider call in step 2 is never repeated. If the executor produces no
+usable outcome, the launcher reports `unknown` (`executor_failed`) for the
+claim it holds. If no report arrives, including when the launcher lost the
+reply to its claim and therefore executed nothing, the service marks the
+request `unknown` (`outcome_unreported`) 15 minutes after the claim; the
+launcher never declares a claim unspent. A request nobody took ends as
+`failed` (`executor_unavailable`) after 10 minutes. Repeating the same request
+while it is still waiting writes the trigger again. The journal receives only
+fixed messages; the service journal records request id, account, state and
+reason.
+
+Only the service removes the trigger: when it hands out, rejects, expires or
+aborts the request, and whenever no request of the account is waiting (checked
+on every redemption call and once per collection interval). The launcher never
+touches it. While a request waits and the launcher cannot take it, the path
+unit starts the unit again after each run. The launcher throttles itself
+instead of relying on systemd start limits, which would leave the units failed
+until an operator intervened:
+
+- Every failed redeem run (service socket unreachable, failed claim, missing or
+  invalid settings, lost report) waits 30 seconds before it exits. The service
+  unit sets `StartLimitIntervalSec=0`, so it is never stopped for restarting,
+  and reads its env file as optional so that even a missing file reaches this
+  pause. When the cause disappears, the next run takes the request with no
+  operator action; no `reset-failed` is needed.
+- A run that cannot get the shared lock within two minutes fails with
+  `quota owner redeem: lock wait exhausted`, pauses and is started again.
+- A request that nobody could take ends as `failed` after its 10 minutes. The
+  service then removes the trigger and the restarts stop.
+
+One deadline covers the whole run: `TimeoutStartSec=20min`. After the lock the
+launcher claims only if 660 seconds still fit: three claim calls with pauses
+(19 s), a Claude credential renewal (95 s), the redemption script's upper limit
+(300 s) with process cleanup (5 s), the report attempts (160 s), the pause after
+a failed run (30 s) and a margin.
+The remaining time serves the following collection, which the deadline may
+cut short without affecting the reported outcome.
+
+Who can spend a credit: the launcher executes whatever request the service
+hands out. The `--allow-redeem-uid` check is made by the service process, so
+it protects against other local users, not against the service identity
+itself. Any process running as the service user (or root) can create or claim
+requests and is therefore trusted to spend the configured accounts' credits. It
+still cannot read a credential or choose the provider call. Independently of
+the service, the credential owner's `redeem-execute` records each execution in
+its private probe home (`redeem-<account>.last`, mode 0600) and refuses a
+second one for the same account within 120 seconds (`owner_rate_limited`).
+The time is taken after any credential renewal, immediately before the provider
+call, and the check and the record are made under one exclusive file lock
+(`redeem-guard.lock`). An unreadable or unsafe record refuses the execution
+(`owner_guard_unavailable`).
+This bounds the rate, not the total: over time the service identity can spend
+every usable credit of an account that has `[sources.redeem]`.
+
+To enable redemption for one existing `agent-quota-owner-collect@<instance>`:
+
+- Install this version's binary and replace
+  `/usr/local/libexec/agent-quota-owner-collect` with the exported
+  `systemd/agent-quota-owner-collect.sh` of the same binary. The redeem unit
+  calls it with the argument `redeem`.
+- Export the assets of this binary to the directory the configuration names and
+  add `[sources.redeem]` to the source, running the provider's `*-redeem.sh`
+  with `instance = "<instance>"`
+  (see [configuration](configuration.md#reset-credit-redemption)).
+- Install both redeem units in `/etc/systemd/system`. They reuse
+  `/etc/agent-quota/probes/<instance>.env` unchanged. If the service home is
+  not `/var/lib/agent-quota`, change the trigger path in the path unit.
+- Add `--allow-redeem-uid <uid>` for each UID that may request redemptions to
+  the service's `serve` command line and restart the service. The UID must also
+  be named by `--allow-uid` (or be the service UID).
+- `systemctl daemon-reload`, then
+  `systemctl enable --now agent-quota-owner-redeem@<instance>.path`. Enable the
+  path unit for one instance per account only.
+
+The redeem mode shares the collection lock, so a redemption waits, for at most
+two minutes, for a running collection of any account.
+
 Synthetic launcher tests cover handoff arguments, lock, failure and size
 boundaries. A separate same-UID test invokes the real `probe` and `ingest`
 commands with the UID switch stubbed. An isolated Linux container test also ran

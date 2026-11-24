@@ -2,7 +2,7 @@
 
 The resident service owns a private SQLite database, collection schedule,
 collector failure backoff, and quota calculations. The CLI and stdio MCP
-frontend use a versioned, read-only Unix socket API; a read never starts a
+frontend use the read methods of a versioned Unix socket API; a read never starts a
 collector or a model. The database holds account-bound physical windows,
 per-window model membership, history, durable exhaustion latches, and the
 latest reset-credit observation per account.
@@ -34,6 +34,16 @@ isolated home and obtained a real Codex quota observation through its API. The
 root-managed launcher's host PAM and systemd lifecycle passed a privileged two-UID
 qualification on dobi (Ubuntu 24.04.5 LTS x86-64) with an earlier candidate of the
 same source line, not the exact release bytes. Other hosts remain unqualified.
+
+An owner may redeem one banked reset credit through a separately authorized
+socket method (`--allow-redeem-uid`, default none). The service only records
+the idempotent request in its database and writes a trigger file in its private
+home. A root-managed launcher takes the request once, lets the credential owner
+run the configured redemption script, reports the outcome and collects again.
+The service still reads no credential and makes no provider call; an ambiguous
+outcome is stored as `unknown` and never retried. The service identity is
+trusted to spend credits; the credential owner only limits the rate. Redemption is not an MCP tool.
+See the [redemption API](api.md#reset-credit-redemption).
 
 Forecasts and advisory recommendations retain the agent-run calculation rules.
 Unknown, expired, failed, and exhausted observations remain distinguishable.

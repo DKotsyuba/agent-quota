@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Added
+
+- Owner-requested redemption of one banked reset credit for Claude, Codex and GLM. New socket methods `redeem_reset_credit` and `redeem_status` are idempotent per client `request_id` and are open only to UIDs named by the new `serve --allow-redeem-uid` flag (default none). `agent-quota redeem` is their CLI client. They are not MCP tools.
+  The service stays credential-free: it records the request and writes a trigger file under its home. The new root-managed `agent-quota-owner-redeem@.path` and `.service` units run the launcher's new `redeem` mode, which executes the new `[sources.redeem]` script (`claude-redeem.sh`, `codex-redeem.sh`, `glm-redeem.sh`) as the credential owner and then collects again. An ambiguous provider outcome is stored as `unknown` and never retried. The service OS identity is trusted to spend credits of accounts that have `[sources.redeem]`; the credential owner executes at most one redemption per account in 120 seconds.
+  Upgrading needs no change for existing deployments; redemption stays off until the flag, the source table and the units are added. See `docs/linux-owner-collection.md`.
+
 ## 0.2.4
 
 Dated 2026-11-24.

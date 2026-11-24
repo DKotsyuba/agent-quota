@@ -66,7 +66,7 @@ impl Write for ByteBudget {
 }
 
 /// Selects one canonical planned external source without resolving any credential.
-fn binding(
+pub(crate) fn binding(
     config: &QuotaConfig,
     account: &str,
     provider: &str,
@@ -90,7 +90,7 @@ fn binding(
 }
 
 /// Returns epoch seconds, refusing a host clock before the epoch without exposing OS errors.
-fn now() -> Result<f64, String> {
+pub(crate) fn now() -> Result<f64, String> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|value| value.as_secs_f64())

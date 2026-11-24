@@ -9,6 +9,11 @@ use crate::quota::{
     QuotaWindow, ResetCreditSnapshot, ResetCredits,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
+
+mod redeem;
+#[cfg(test)]
+pub use redeem::CLAIM_TTL_SECONDS as REDEEM_CLAIM_TTL_SECONDS;
+pub use redeem::{RedeemClaim, RedeemError};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
@@ -307,6 +312,7 @@ impl QuotaStore {
              account_id TEXT PRIMARY KEY NOT NULL REFERENCES provider_accounts(account_id),\
              observed_at REAL NOT NULL, inventory_json TEXT NOT NULL);",
         )?;
+        Self::redeem_schema(&tx)?;
         tx.commit()?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         Ok(Self { conn })

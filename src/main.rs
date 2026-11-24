@@ -11,6 +11,7 @@ mod forecast;
 mod ipc;
 mod process;
 mod quota;
+mod redeem;
 mod refresh;
 mod response;
 mod service;
@@ -57,6 +58,10 @@ enum Commands {
         /// Additional explicitly authorized local client UIDs.
         #[arg(long = "allow-uid")]
         allowed_uids: Vec<u32>,
+        /// Client UIDs that may request reset-credit redemptions; none by default.
+        /// Each must be the service UID or also be named by --allow-uid.
+        #[arg(long = "allow-redeem-uid")]
+        redeem_uids: Vec<u32>,
     },
     /// Read ready-made quota metrics from the running service as JSON.
     Limits {
@@ -110,6 +115,54 @@ enum Commands {
     Ingest {
         #[arg(long)]
         socket: Option<PathBuf>,
+    },
+    /// Ask the service to redeem one banked reset credit; needs --allow-redeem-uid.
+    Redeem {
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        #[arg(long)]
+        server_uid: Option<u32>,
+        #[arg(long)]
+        account: String,
+        /// Credit id from the account's `reset_credits` inventory.
+        #[arg(long)]
+        credit: String,
+        /// Version-4 UUID identifying this attempt; generated when omitted.
+        #[arg(long)]
+        request_id: Option<String>,
+        /// Poll the request for up to this many seconds while it is pending.
+        #[arg(long)]
+        wait: Option<u64>,
+    },
+    /// Launcher step, as the service user: take the account's pending redemption.
+    RedeemClaim {
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        #[arg(long)]
+        account: String,
+    },
+    /// Launcher step, as the credential owner: redeem the claim read from stdin.
+    RedeemExecute {
+        #[arg(long)]
+        home: PathBuf,
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        account: String,
+        #[arg(long)]
+        provider: String,
+        #[arg(long)]
+        source: String,
+    },
+    /// Launcher step, as the service user: store the outcome read from stdin.
+    RedeemReport {
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        /// Read the claim from stdin instead and report this verdict for it.
+        #[arg(long)]
+        state: Option<String>,
+        #[arg(long, requires = "state")]
+        reason: Option<String>,
     },
     /// Export the collector and Linux launcher files embedded in this executable.
     ExportAssets {
@@ -444,6 +497,7 @@ async fn read_service(
         accounts,
         model,
         observation: None,
+        ..Default::default()
     };
     match ipc::request(&path, &request, server_uid.unwrap_or_else(ipc::owner_uid)).await {
         Ok(ipc::Reply::Result { result, .. }) => print_json(result),
@@ -469,6 +523,7 @@ async fn hook_context(
         accounts: Vec::new(),
         model: None,
         observation: None,
+        ..Default::default()
     };
     let uid = server_uid.unwrap_or_else(ipc::owner_uid);
     match tokio::time::timeout(HOOK_READ_DEADLINE, ipc::request(&path, &request, uid)).await {
@@ -524,11 +579,193 @@ async fn ingest_service(socket: Option<PathBuf>) -> ExitCode {
         accounts: Vec::new(),
         model: None,
         observation: Some(observation),
+        ..Default::default()
     };
     match ipc::request(&path, &request, ipc::owner_uid()).await {
         Ok(ipc::Reply::Result { result, .. }) => print_json(result),
         Ok(ipc::Reply::Error { error, .. }) | Err(error) => {
             eprintln!("quota ingest: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Sends one redemption-related request and returns its verified result.
+async fn redeem_call(
+    path: &std::path::Path,
+    uid: u32,
+    request: ipc::Request,
+) -> Result<serde_json::Value, String> {
+    match ipc::request(path, &request, uid).await {
+        Ok(ipc::Reply::Result { result, .. }) => Ok(result),
+        Ok(ipc::Reply::Error { error, .. }) | Err(error) => Err(error),
+    }
+}
+
+/// Requests one redemption and optionally waits for its final state.
+///
+/// Exit status: 0 for `redeemed` or a still `pending` request, 2 for `rejected`,
+/// `failed` or `unknown`, 1 when the service gave no record. A lost reply is
+/// resolved by reading the same request id; the request is never sent twice with
+/// different ids.
+async fn redeem_client(
+    socket: Option<PathBuf>,
+    server_uid: Option<u32>,
+    account: String,
+    credit: String,
+    request_id: Option<String>,
+    wait: Option<u64>,
+) -> ExitCode {
+    let (path, request_id) = match socket_path(socket)
+        .and_then(|path| Ok((path, request_id.map_or_else(redeem::new_request_id, Ok)?)))
+    {
+        Ok(values) => values,
+        Err(code) => {
+            eprintln!("quota redeem: {code}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let uid = server_uid.unwrap_or_else(ipc::owner_uid);
+    let status = || ipc::Request {
+        version: 1,
+        method: "redeem_status".into(),
+        request_id: Some(request_id.clone()),
+        ..Default::default()
+    };
+    let submit = ipc::Request {
+        version: 1,
+        method: "redeem_reset_credit".into(),
+        account: Some(account),
+        credit_id: Some(credit),
+        request_id: Some(request_id.clone()),
+        ..Default::default()
+    };
+    let mut record = match redeem_call(&path, uid, submit).await {
+        Err(code) if code == "outcome_unknown" => redeem_call(&path, uid, status()).await,
+        other => other,
+    };
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(wait.unwrap_or(0));
+    while matches!(&record, Ok(value) if value["state"] == "pending")
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        if let Ok(value) = redeem_call(&path, uid, status()).await {
+            record = Ok(value);
+        }
+    }
+    match record {
+        Ok(value) => {
+            let finished = matches!(value["state"].as_str(), Some("redeemed" | "pending"));
+            let printed = print_json(&value);
+            if finished { printed } else { ExitCode::from(2) }
+        }
+        Err(code) => {
+            eprintln!("quota redeem: {code} (request_id {request_id})");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Writes one compact nonsecret launcher message to stdout.
+fn print_line(value: &serde_json::Value) -> ExitCode {
+    use std::io::Write;
+    let mut bytes = value.to_string().into_bytes();
+    bytes.push(b'\n');
+    if bytes.len() > redeem::MAX_MESSAGE_BYTES
+        || std::io::stdout().lock().write_all(&bytes).is_err()
+    {
+        return ExitCode::FAILURE;
+    }
+    ExitCode::SUCCESS
+}
+
+/// Prints the claimed request, or exits 3 when the account has none pending.
+async fn redeem_claim(socket: Option<PathBuf>, account: String) -> ExitCode {
+    let request = ipc::Request {
+        version: 1,
+        method: "redeem_claim".into(),
+        account: Some(account),
+        ..Default::default()
+    };
+    let result = match socket_path(socket) {
+        Ok(path) => redeem_call(&path, ipc::owner_uid(), request).await,
+        Err(code) => Err(code.to_owned()),
+    };
+    match result {
+        Ok(value) if value["request"].is_null() => ExitCode::from(3),
+        Ok(value) => print_line(&value["request"]),
+        Err(code) => {
+            eprintln!("quota redeem-claim: {code}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Reads one bounded JSON launcher message from stdin.
+fn read_message() -> Result<serde_json::Value, &'static str> {
+    let bytes = read_bounded(
+        &mut std::io::stdin().lock(),
+        redeem::MAX_MESSAGE_BYTES,
+        std::time::Duration::from_secs(30),
+    )
+    .map_err(|_| "invalid_request")?;
+    serde_json::from_slice(&bytes).map_err(|_| "invalid_request")
+}
+
+/// Redeems the claim on stdin as this OS user and prints the outcome.
+async fn redeem_execute(
+    home: PathBuf,
+    config: PathBuf,
+    account: String,
+    provider: String,
+    source: String,
+) -> ExitCode {
+    let outcome = async {
+        let claim = read_message().map_err(str::to_owned)?;
+        let home = service::prepare_home(&home)?;
+        redeem::execute(&config, &home, &account, &provider, &source, claim)
+            .await
+            .map_err(str::to_owned)
+    }
+    .await;
+    match outcome.map(serde_json::to_value) {
+        Ok(Ok(value)) => print_line(&value),
+        Ok(Err(_)) => ExitCode::FAILURE,
+        Err(code) => {
+            eprintln!("quota redeem-execute: {code}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Submits a verdict to the owner-only endpoint. Stdin holds the executor's outcome,
+/// or, with `--state`, the claim for which the launcher itself reports that verdict.
+/// Either way the report carries the claim token and addresses only that claim.
+async fn redeem_report(
+    socket: Option<PathBuf>,
+    state: Option<String>,
+    reason: Option<String>,
+) -> ExitCode {
+    let outcome = read_message().and_then(|message| match &state {
+        Some(state) => redeem::launcher_outcome(message, state, reason.as_deref()),
+        None => Ok(message),
+    });
+    let result = match (outcome, socket_path(socket)) {
+        (Ok(outcome), Ok(path)) => {
+            let request = ipc::Request {
+                version: 1,
+                method: "redeem_report".into(),
+                outcome: Some(outcome),
+                ..Default::default()
+            };
+            redeem_call(&path, ipc::owner_uid(), request).await
+        }
+        (Err(code), _) | (_, Err(code)) => Err(code.to_owned()),
+    };
+    match result {
+        Ok(value) => print_line(&value),
+        Err(code) => {
+            eprintln!("quota redeem-report: {code}");
             ExitCode::FAILURE
         }
     }
@@ -576,6 +813,7 @@ async fn main() -> ExitCode {
                         accounts: Vec::new(),
                         model: None,
                         observation: None,
+                        ..Default::default()
                     };
                     matches!(ipc::request(&path, &request, server_uid.unwrap_or_else(ipc::owner_uid)).await,
                         Ok(ipc::Reply::Result { result, .. }) if result["status"] == "running")
@@ -637,6 +875,7 @@ async fn main() -> ExitCode {
             config,
             socket,
             allowed_uids,
+            redeem_uids,
         } => {
             let home = match home.or_else(default_home) {
                 Some(home) if home.is_absolute() => home,
@@ -665,7 +904,7 @@ async fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            match service::serve(engine, socket, allowed_uids).await {
+            match service::serve(engine, socket, allowed_uids, redeem_uids).await {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(code) => {
                     eprintln!("service: {code}");
@@ -726,6 +965,27 @@ async fn main() -> ExitCode {
             }
         }
         Commands::Ingest { socket } => ingest_service(socket).await,
+        Commands::Redeem {
+            socket,
+            server_uid,
+            account,
+            credit,
+            request_id,
+            wait,
+        } => redeem_client(socket, server_uid, account, credit, request_id, wait).await,
+        Commands::RedeemClaim { socket, account } => redeem_claim(socket, account).await,
+        Commands::RedeemExecute {
+            home,
+            config,
+            account,
+            provider,
+            source,
+        } => redeem_execute(home, config, account, provider, source).await,
+        Commands::RedeemReport {
+            socket,
+            state,
+            reason,
+        } => redeem_report(socket, state, reason).await,
         Commands::ExportAssets { directory } => match assets::export(&directory) {
             Ok(report) => print_asset_report(report, true),
             Err(code) => {
