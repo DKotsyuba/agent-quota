@@ -10,7 +10,8 @@
 //! `harness.refresh_oauth` opts a Claude login in to renewal by its own CLI.
 //! Without that override only context creation consults the harness's native
 //! environment convention. Unknown fields and literal/untyped secrets are rejected.
-//! Capacity ranking uses an optional source `priority_multiplier` (account weight
+//! Optional `[sources.redeem]` names the reset-credit redemption command of an
+//! external source. Capacity ranking uses an optional source `priority_multiplier` (account weight
 //! for that provider binding) and optional `[providers.<alias>]` tables with
 //! `priority_multiplier` and `ordered_accounts`; both default to neutral.
 
@@ -19,6 +20,7 @@ use crate::{
     collector::CollectorBinding,
     credentials::{CREDENTIAL_EXPIRED, CREDENTIAL_UNAVAILABLE, CredentialRef},
     quota::{AccountId, MAX_OUTPUT_MODELS},
+    redeem::RedeemBinding,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -130,6 +132,9 @@ pub struct SourceConfig {
     /// Exact invocation policy, required for `exec` and forbidden for `none`.
     #[serde(default)]
     pub collector: Option<CollectorBinding>,
+    /// Optional reset-credit redemption command; only for `execution = "external"`.
+    #[serde(default)]
+    pub redeem: Option<RedeemBinding>,
     /// Positive finite account weight for this provider binding, default one.
     /// The effective weight of an account on one model is the maximum of its
     /// eligible bindings, never a sum. It affects only capacity ranking.
@@ -291,6 +296,9 @@ impl QuotaConfig {
                 if unit.collector != source.collector {
                     return Err("conflicting_collector_alias".into());
                 }
+                if unit.redeem != source.redeem {
+                    return Err("conflicting_redeem_alias".into());
+                }
                 let mut models: BTreeMap<String, ModelConfig> = unit
                     .models
                     .iter()
@@ -306,6 +314,18 @@ impl QuotaConfig {
                 unit.models = models.into_values().collect();
             } else {
                 units.insert(key, source.clone());
+            }
+        }
+        // One redemption binding per account and one account per launcher instance,
+        // so a trigger file always names exactly one executor.
+        let mut accounts = BTreeSet::new();
+        let mut instances = BTreeSet::new();
+        for unit in units.values() {
+            if let Some(redeem) = &unit.redeem
+                && (!accounts.insert(unit.account.as_str())
+                    || !instances.insert(redeem.instance(unit.account.as_str())))
+            {
+                return Err("conflicting_redeem_binding".into());
             }
         }
         Ok(units.into_values().collect())
@@ -369,6 +389,12 @@ impl SourceConfig {
             (LimitsSource::None, None) => {}
             (LimitsSource::Exec, None) => return Err("exec_collector_required".into()),
             (LimitsSource::None, Some(_)) => return Err("none_collector_forbidden".into()),
+        }
+        if let Some(redeem) = &self.redeem {
+            if self.execution != ExecutionMode::External {
+                return Err("redeem_requires_external".into());
+            }
+            redeem.validate()?;
         }
         if self.models.len() > MAX_OUTPUT_MODELS {
             return Err("too_many_native_models".into());

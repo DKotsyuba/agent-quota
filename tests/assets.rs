@@ -54,7 +54,7 @@ fn export_and_verify_embedded_assets() {
         String::from_utf8_lossy(&exported.stderr)
     );
     let report: serde_json::Value = serde_json::from_slice(&exported.stdout).unwrap();
-    assert_eq!(report["files"], 14);
+    assert_eq!(report["files"], 19);
     assert_eq!(report["verified"], true);
     let codex = directory.join("collectors/codex.sh");
     assert_eq!(

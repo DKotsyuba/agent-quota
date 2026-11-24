@@ -10,8 +10,10 @@ use crate::{
         AccountId, CollectorScope, MAX_OUTPUT_MODELS, MAX_OUTPUT_WINDOWS,
         normalize_collector_output,
     },
-    refresh,
-    store::{AccountQuotaHistory, ExhaustionLatch, QuotaStore, StoreError, StoredWindow},
+    redeem, refresh,
+    store::{
+        AccountQuotaHistory, ExhaustionLatch, QuotaStore, RedeemError, StoreError, StoredWindow,
+    },
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -409,6 +411,168 @@ impl Engine {
         Ok(json!({"stored":true,"revision":committed}))
     }
 
+    /// Returns the current valid configuration, or the last accepted one.
+    fn current_settings(&self) -> Result<Settings, &'static str> {
+        match self.reload() {
+            Ok(settings) => Ok(settings),
+            Err(_) => Ok(self.settings.lock().map_err(|_| "internal_error")?.clone()),
+        }
+    }
+
+    /// Removes triggers of accounts without a request waiting for a launcher, so an
+    /// expired or aborted request cannot keep starting the path-triggered unit.
+    fn sweep_triggers(&self, store: &QuotaStore, sources: &[SourceConfig]) {
+        // Without a reliable answer nothing is removed.
+        let Ok(known) = store.redeem_instances() else {
+            return;
+        };
+        let waiting: BTreeSet<&str> = known
+            .iter()
+            .filter(|(_, waits)| *waits)
+            .map(|(instance, _)| instance.as_str())
+            .collect();
+        // Instances recorded on requests cover bindings that were renamed or removed
+        // from the configuration after a request was admitted.
+        let configured = sources.iter().filter_map(|unit| {
+            unit.redeem
+                .as_ref()
+                .map(|binding| binding.instance(unit.account.as_str()))
+        });
+        for instance in configured.chain(known.iter().map(|(instance, _)| instance.as_str())) {
+            if !waiting.contains(instance) {
+                redeem::remove_trigger(&self.home, instance);
+            }
+        }
+    }
+
+    /// Applies the redemption time limits and clears triggers nobody waits for, so an
+    /// unreachable launcher cannot be restarted forever by a stale trigger.
+    pub(crate) fn redeem_housekeeping(&self) {
+        let Ok(sources) = self
+            .settings
+            .lock()
+            .map(|settings| settings.sources.clone())
+        else {
+            return;
+        };
+        if let Ok(mut store) = self.store.lock()
+            && store.redeem_expire(now()).is_ok()
+        {
+            self.sweep_triggers(&store, &sources);
+        }
+    }
+
+    /// Records one idempotent redemption request and triggers its launcher.
+    ///
+    /// A refusal is a stored `rejected` record, not an error. The provider is not
+    /// contacted here; the service holds no credential.
+    pub(crate) fn redeem_request(
+        &self,
+        account: &str,
+        credit_id: &str,
+        request_id: &str,
+    ) -> Result<Value, &'static str> {
+        if !redeem::valid_request_id(request_id) || !redeem::valid_credit_id(credit_id) {
+            return Err("invalid_request");
+        }
+        let settings = self.current_settings()?;
+        let id = AccountId::from_str(account).map_err(|_| "unknown_account")?;
+        if !settings
+            .config
+            .sources
+            .iter()
+            .any(|source| source.account == id)
+        {
+            return Err("unknown_account");
+        }
+        let binding = redeem::binding(&settings.sources, account);
+        let mut store = self.store.lock().map_err(|_| "internal_error")?;
+        let at = now();
+        let refusal = binding.is_none().then_some("redeem_not_configured");
+        // The request is pinned to this exact configuration and launcher instance.
+        let pin =
+            binding.map(|(_, binding)| (settings.revision.as_str(), binding.instance(account)));
+        let mut record = store
+            .redeem_request(&id, credit_id, request_id, refusal, pin, at)
+            .map_err(redeem_error)?;
+        if record.state == "pending"
+            && let Some((_, binding)) = binding
+            && let Err(code) =
+                redeem::write_trigger(&self.home, binding.instance(account), request_id)
+        {
+            record = store
+                .redeem_abort(request_id, code, now())
+                .map_err(redeem_error)?;
+        }
+        self.sweep_triggers(&store, &settings.sources);
+        if record.created_at == at as i64 {
+            eprintln!(
+                "quota redeem: request {} account {} state {}",
+                record.request_id, record.account, record.state
+            );
+        }
+        serde_json::to_value(record).map_err(|_| "internal_error")
+    }
+
+    /// Returns the latest state of one redemption request.
+    pub(crate) fn redeem_status(&self, request_id: &str) -> Result<Value, &'static str> {
+        if !redeem::valid_request_id(request_id) {
+            return Err("invalid_request");
+        }
+        let sources = self
+            .settings
+            .lock()
+            .map_err(|_| "internal_error")?
+            .sources
+            .clone();
+        let mut store = self.store.lock().map_err(|_| "internal_error")?;
+        let record = store.redeem_status(request_id, now());
+        // Reading applies the time limits, which may have ended a waiting request.
+        self.sweep_triggers(&store, &sources);
+        serde_json::to_value(record.map_err(redeem_error)?).map_err(|_| "internal_error")
+    }
+
+    /// Hands an account's pending request to its launcher once and acknowledges the trigger.
+    pub(crate) fn redeem_claim(&self, account: &str) -> Result<Value, &'static str> {
+        let id = AccountId::from_str(account).map_err(|_| "unknown_account")?;
+        let settings = self.current_settings()?;
+        let instance = redeem::binding(&settings.sources, account)
+            .map_or(account, |(_, binding)| binding.instance(account));
+        let mut store = self.store.lock().map_err(|_| "internal_error")?;
+        let claim = store
+            .redeem_claim(&id, &settings.revision, now())
+            .map_err(redeem_error)?;
+        // Removed while the store is held, so a new request's trigger cannot be lost.
+        redeem::remove_trigger(&self.home, instance);
+        self.sweep_triggers(&store, &settings.sources);
+        Ok(json!({"request": claim.as_ref().map(redeem::claim_value)}))
+    }
+
+    /// Stores the executor's verdict for a claimed request.
+    pub(crate) fn redeem_report(&self, outcome: Value) -> Result<Value, &'static str> {
+        let outcome = redeem::Outcome::parse(outcome)?;
+        let id = AccountId::from_str(&outcome.account).map_err(|_| "unknown_account")?;
+        let mut store = self.store.lock().map_err(|_| "internal_error")?;
+        let record = store
+            .redeem_report(
+                &id,
+                &outcome.request_id,
+                &outcome.claim_token,
+                &outcome.state,
+                outcome.reason.as_deref(),
+                now(),
+            )
+            .map_err(redeem_error)?;
+        eprintln!(
+            "quota redeem: request {} account {} state {} reason {}",
+            record.request_id,
+            record.account,
+            record.state,
+            record.reason.as_deref().unwrap_or("none")
+        );
+        serde_json::to_value(record).map_err(|_| "internal_error")
+    }
+
     /// Runs collections without overlap until shutdown, preserving the configured cadence.
     pub(crate) async fn poll(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) {
         loop {
@@ -421,6 +585,7 @@ impl Engine {
                     if let Err(code) = result { eprintln!("quota collection: {code}"); }
                 }
             }
+            self.redeem_housekeeping();
             let interval = match self.settings.lock() {
                 Ok(settings) => settings.config.interval_seconds,
                 Err(_) => return,
@@ -1036,6 +1201,161 @@ binary = "/bin/true"
         assert_eq!(result["config_revision"], original);
     }
 
+    const REDEEM_CONFIG: &str = r#"
+[[sources]]
+account = "fixture"
+provider = "glm"
+auth_family = "zai"
+credential = "file:/synthetic/credential"
+execution = "external"
+models = [{ id = "model-a" }]
+[sources.harness]
+id = "claude-code"
+binary = "/bin/true"
+[sources.collector]
+command = "/bin/true"
+source = "fixture-source"
+[sources.redeem]
+command = "/bin/true"
+instance = "fixture-instance"
+"#;
+
+    /// Opens an engine whose one account has a redemption binding and a usable credit.
+    fn redeem_fixture() -> (tempfile::TempDir, Arc<Engine>, PathBuf, AccountId) {
+        use crate::quota::{
+            NormalizedQuotaSnapshot, ResetCredit, ResetCreditSnapshot, ResetCredits,
+        };
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let config = root.path().join("config.toml");
+        std::fs::write(&config, REDEEM_CONFIG).unwrap();
+        let engine = Engine::open(&root.path().join("home"), &config).unwrap();
+        let account = AccountId::from_str("fixture").unwrap();
+        let at = now() - 5.0;
+        let snapshot = NormalizedQuotaSnapshot {
+            account: account.clone(),
+            models: Vec::new(),
+            reset_credits: ResetCreditSnapshot {
+                observed_at: Some(at),
+                inventory: ResetCredits {
+                    known: true,
+                    available_count: Some(1),
+                    credits: vec![ResetCredit {
+                        id: "credit-a".into(),
+                        provider_kind: "FIVE_HOUR".into(),
+                        label: "Fixture".into(),
+                        scope: "five_hour".into(),
+                        resets_left: None,
+                        usable_now: Some(true),
+                        granted_at: None,
+                        expires_at: None,
+                    }],
+                },
+            },
+        };
+        engine
+            .store
+            .lock()
+            .unwrap()
+            .record_snapshot("glm", &snapshot, 10, at)
+            .unwrap();
+        (root, engine, config, account)
+    }
+
+    /// A trigger exists only while a request waits for a launcher: expiry and a claim
+    /// made behind the service's back both remove it.
+    #[test]
+    fn redeem_trigger_is_removed_when_no_request_waits() {
+        let (_root, engine, _config, account) = redeem_fixture();
+        let revision = engine.settings.lock().unwrap().revision.clone();
+        let trigger = engine.home.join("redeem/fixture-instance.pending");
+        let one = "11111111-1111-4111-8111-111111111111";
+        let two = "22222222-2222-4222-8222-222222222222";
+        let pending = engine.redeem_request("fixture", "credit-a", one).unwrap();
+        assert_eq!(pending["state"], "pending");
+        assert!(trigger.exists());
+        // The time limit ends the unclaimed request; housekeeping clears its trigger.
+        let late = now() + crate::store::REDEEM_CLAIM_TTL_SECONDS + 1.0;
+        assert_eq!(
+            engine
+                .store
+                .lock()
+                .unwrap()
+                .redeem_status(one, late)
+                .unwrap()
+                .state,
+            "failed"
+        );
+        assert!(trigger.exists());
+        engine.redeem_housekeeping();
+        assert!(!trigger.exists());
+        assert_eq!(
+            engine.redeem_status(one).unwrap()["reason"],
+            "executor_unavailable"
+        );
+
+        let pending = engine.redeem_request("fixture", "credit-a", two).unwrap();
+        assert_eq!(pending["state"], "pending");
+        assert!(trigger.exists());
+        engine
+            .store
+            .lock()
+            .unwrap()
+            .redeem_claim(&account, &revision, now())
+            .unwrap()
+            .unwrap();
+        // Repeating the request neither re-arms a taken request nor leaves a trigger.
+        assert_eq!(
+            engine.redeem_request("fixture", "credit-a", two).unwrap(),
+            pending
+        );
+        assert!(!trigger.exists());
+        assert_eq!(
+            engine.redeem_claim("fixture").unwrap()["request"],
+            Value::Null
+        );
+    }
+
+    /// A request is pinned to the configuration it was admitted under. After any change
+    /// it is not handed out, and the trigger of its former launcher instance is removed
+    /// although that instance is no longer configured.
+    #[test]
+    fn redeem_request_is_not_handed_out_after_its_binding_changed() {
+        let (_root, engine, config, _account) = redeem_fixture();
+        let old_trigger = engine.home.join("redeem/fixture-instance.pending");
+        let one = "11111111-1111-4111-8111-111111111111";
+        assert_eq!(
+            engine.redeem_request("fixture", "credit-a", one).unwrap()["state"],
+            "pending"
+        );
+        assert!(old_trigger.exists());
+        std::fs::write(
+            &config,
+            REDEEM_CONFIG.replace("fixture-instance", "renamed-instance"),
+        )
+        .unwrap();
+        assert_eq!(
+            engine.redeem_claim("fixture").unwrap()["request"],
+            Value::Null
+        );
+        let ended = engine.redeem_status(one).unwrap();
+        assert_eq!(ended["state"], "failed");
+        assert_eq!(ended["reason"], "binding_changed");
+        assert!(!old_trigger.exists());
+        assert!(!engine.home.join("redeem/renamed-instance.pending").exists());
+
+        // An unchanged binding is handed out with the pinned revision and a token.
+        let (_root, engine, _config, _account) = redeem_fixture();
+        engine.redeem_request("fixture", "credit-a", one).unwrap();
+        let claim = engine.redeem_claim("fixture").unwrap()["request"].clone();
+        assert_eq!(claim["request_id"], one);
+        assert_eq!(
+            claim["config_revision"],
+            engine.settings.lock().unwrap().revision.as_str()
+        );
+        assert_eq!(claim["claim_token"].as_str().unwrap().len(), 32);
+    }
+
     /// Two services cannot share a home and collect the same configured sources concurrently.
     #[test]
     fn service_home_has_one_live_owner() {
@@ -1257,6 +1577,15 @@ source = "fixture-source"
     }
 }
 
+/// Maps a redemption store refusal to its public protocol code.
+fn redeem_error(error: RedeemError) -> &'static str {
+    match error {
+        RedeemError::Conflict => "request_conflict",
+        RedeemError::Unknown => "unknown_request",
+        RedeemError::Store => "storage_error",
+    }
+}
+
 /// Waits for a cooperative stop signal or the sender's disappearance.
 async fn stopped(mut shutdown: watch::Receiver<bool>) {
     loop {
@@ -1271,7 +1600,15 @@ pub(crate) async fn serve(
     engine: Arc<Engine>,
     socket: PathBuf,
     allowed_uids: Vec<u32>,
+    redeem_uids: Vec<u32>,
 ) -> Result<(), String> {
+    // A redemption UID must already be able to connect; it gains no read access here.
+    if redeem_uids
+        .iter()
+        .any(|uid| *uid != crate::ipc::owner_uid() && !allowed_uids.contains(uid))
+    {
+        return Err("redeem_uid_not_allowed".into());
+    }
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|_| "signal_setup_failed".to_owned())?;
     let (stop, receiver) = watch::channel(false);
@@ -1282,6 +1619,7 @@ pub(crate) async fn serve(
         crate::ipc::serve_ready(
             &socket,
             allowed_uids,
+            redeem_uids,
             move |request| {
                 let result = match request.method.as_str() {
                     "status" => api_engine.status(),
@@ -1291,6 +1629,30 @@ pub(crate) async fn serve(
                         .observation
                         .ok_or("invalid_observation")
                         .and_then(|value| api_engine.ingest(value)),
+                    "redeem_reset_credit" => match (
+                        request.account.as_deref(),
+                        request.credit_id.as_deref(),
+                        request.request_id.as_deref(),
+                    ) {
+                        (Some(account), Some(credit), Some(id)) => {
+                            api_engine.redeem_request(account, credit, id)
+                        }
+                        _ => Err("invalid_request"),
+                    },
+                    "redeem_status" => request
+                        .request_id
+                        .as_deref()
+                        .ok_or("invalid_request")
+                        .and_then(|id| api_engine.redeem_status(id)),
+                    "redeem_claim" => request
+                        .account
+                        .as_deref()
+                        .ok_or("invalid_request")
+                        .and_then(|account| api_engine.redeem_claim(account)),
+                    "redeem_report" => request
+                        .outcome
+                        .ok_or("invalid_request")
+                        .and_then(|outcome| api_engine.redeem_report(outcome)),
                     _ => Err("unsupported_method"),
                 };
                 match result {

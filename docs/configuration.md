@@ -62,6 +62,63 @@ source; one without a collector uses `limits_source = "none"` and stays
 `partial` until the next completed collection round under that revision. The
 weights affect only the capacity order; collection and `get_quota` are unchanged.
 
+## Reset-credit redemption
+
+An external source can name the command that redeems one banked reset credit of
+its account. Without this table every redemption request for the account is
+rejected with `redeem_not_configured`.
+
+```toml
+[sources.redeem]                 # only with execution = "external"
+command = "/bin/bash"
+args = ["/absolute/quota-assets/collectors/claude-redeem.sh"]
+timeout_seconds = 60             # 1–300, default 60
+env_from = []                    # optional granted environment names
+instance = "claude-subscription" # launcher instance; default: the account id
+```
+
+At most one source per account may carry this table, and two accounts cannot
+share an `instance`. `instance` (1–96 of `A-Za-z0-9_.-`, alphanumeric first) names
+the trigger file `<service home>/redeem/<instance>.pending` and must equal the
+`agent-quota-owner-redeem@<instance>` unit instance, which is also the name of
+that unit's `/etc/agent-quota/probes/<instance>.env`. The command runs as the
+credential owner, never as the service, and receives the collector's private
+version-1 context on stdin with one added object:
+
+```json
+{"redeem":{"request_id":"<uuid>","credit_id":"<id>","scope":"five_hour","provider_kind":"GRANT"}}
+```
+
+It must print one JSON object `{"version":1,"state":S,"reason":R}` where `S` is
+`redeemed`, `rejected`, `failed` or `unknown` and `R` is one of the reason codes
+listed for that state in the [API](api.md#reset-credit-redemption) (null only
+for `redeemed`). Any other code makes the outcome `unknown`
+(`redeem_output_invalid`). `failed` is reserved for cases in which the
+provider was certainly not asked to redeem. A timeout, nonzero exit, invalid
+output or an echoed credential becomes `unknown`; nothing is retried. The
+supplied scripts are:
+
+- `claude-redeem.sh [origin]`: reads `GET /api/oauth/profile` for the
+  organization UUID, then sends one
+  `POST /api/organizations/<uuid>/reset_rate_limits` with
+  `{"program":"cedar_ember","grant_id":<credit id>,"request_id":<request id>}`
+  and the same client headers as `claude.sh`. Only a 2xx answer with a known
+  `result` is a verdict and 401/403 is `failed`; every other answer is `unknown`. Needs a token credential context,
+  as the Claude collector does.
+- `codex-redeem.sh`: starts the configured Codex CLI's app-server in a temporary
+  home, as `codex.sh` does, and sends one `account/rateLimitResetCredit/consume`
+  with `idempotencyKey` = request id and `creditId` = credit id. No model turn
+  is started. A CLI that answers "method not found" or "invalid params" yields
+  `failed` (`codex_method_unsupported`); every other RPC error is `unknown`.
+- `glm-redeem.sh [quota-url]`: sends one
+  `POST <origin of the quota URL>/api/biz/customer-package-reset/use` with
+  `targetType`, `resetType` (`FIVE_HOUR` or `WEEK` from the credit scope),
+  `recordId`, `requestId` and, when known, `grantType`. Only HTTP 200 with
+  `success: true` and code 0 or 200 is `redeemed`; HTTP 401/403, or HTTP 200
+  with `success: false` and code 1001, is `failed`; every other answer is
+  `unknown`. Pass the same URL
+  argument as `glm.sh` when a regional host is configured.
+
 ## Credential references
 
 Never put a token value in TOML, command arguments, diagnostics, or logs.

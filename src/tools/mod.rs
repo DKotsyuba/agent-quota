@@ -336,6 +336,7 @@ async fn quota_reply(
         accounts: args.accounts,
         model: args.model.clone(),
         observation: None,
+        ..Default::default()
     };
     let value = match crate::ipc::request(socket, &request, server_uid).await {
         Ok(crate::ipc::Reply::Result { result, .. }) => result,
@@ -528,6 +529,7 @@ async fn capacity_reply(
         accounts: Vec::new(),
         model: args.model,
         observation: None,
+        ..Default::default()
     };
     let value = match crate::ipc::request(socket, &request, server_uid).await {
         Ok(crate::ipc::Reply::Result { result, .. }) => result,

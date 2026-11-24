@@ -11,5 +11,7 @@ mod install;
 mod owner_launcher;
 #[path = "../protocol.rs"]
 mod protocol;
+#[path = "../redeem.rs"]
+mod redeem;
 #[path = "../service.rs"]
 mod service;

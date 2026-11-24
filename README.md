@@ -73,6 +73,8 @@ Configure collector paths under the exported `collectors/` directory. Exports
 never overwrite an existing directory; an interrupted export may leave a partial
 directory to inspect. A separate credential owner can use the external-probe
 path or review the [optional Linux launcher](docs/linux-owner-collection.md).
+An owner UID named by `serve --allow-redeem-uid` can spend a banked reset credit
+with `agent-quota redeem`; see the [redemption API](docs/api.md#reset-credit-redemption).
 `doctor --json` reports the frontend and service separately and exits nonzero
 when the service cannot be reached; it does not query providers.
 

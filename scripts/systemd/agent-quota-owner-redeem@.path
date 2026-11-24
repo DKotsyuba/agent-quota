@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch for a requested agent-quota reset-credit redemption (%i)
+
+[Path]
+PathExists=/var/lib/agent-quota/redeem/%i.pending
+Unit=agent-quota-owner-redeem@%i.service
+
+[Install]
+WantedBy=paths.target

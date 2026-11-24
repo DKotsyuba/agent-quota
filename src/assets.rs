@@ -86,6 +86,24 @@ const ASSETS: &[Asset] = &[
         executable: false,
     },
     Asset {
+        directory: "collectors",
+        name: "claude-redeem.sh",
+        bytes: include_bytes!("../scripts/collectors/claude-redeem.sh"),
+        executable: true,
+    },
+    Asset {
+        directory: "collectors",
+        name: "codex-redeem.sh",
+        bytes: include_bytes!("../scripts/collectors/codex-redeem.sh"),
+        executable: true,
+    },
+    Asset {
+        directory: "collectors",
+        name: "glm-redeem.sh",
+        bytes: include_bytes!("../scripts/collectors/glm-redeem.sh"),
+        executable: true,
+    },
+    Asset {
         directory: "systemd",
         name: "agent-quota-owner-collect.sh",
         bytes: include_bytes!("../scripts/systemd/agent-quota-owner-collect.sh"),
@@ -101,6 +119,18 @@ const ASSETS: &[Asset] = &[
         directory: "systemd",
         name: "agent-quota-owner-collect@.timer",
         bytes: include_bytes!("../scripts/systemd/agent-quota-owner-collect@.timer"),
+        executable: false,
+    },
+    Asset {
+        directory: "systemd",
+        name: "agent-quota-owner-redeem@.service",
+        bytes: include_bytes!("../scripts/systemd/agent-quota-owner-redeem@.service"),
+        executable: false,
+    },
+    Asset {
+        directory: "systemd",
+        name: "agent-quota-owner-redeem@.path",
+        bytes: include_bytes!("../scripts/systemd/agent-quota-owner-redeem@.path"),
         executable: false,
     },
     Asset {

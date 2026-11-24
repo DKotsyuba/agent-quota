@@ -2,7 +2,8 @@
 
 The resident service exposes protocol version 1 as one newline-delimited JSON
 request and response per Unix socket connection. Reads use persisted observations;
-they do not run collectors or start model turns. The service and client authenticate
+they do not run collectors or start model turns. The only client-initiated
+change is the separately authorized [reset-credit redemption](#reset-credit-redemption). The service and client authenticate
 the local peer by UID. The default socket is owner-only; a separate explicitly
 allowlisted client UID requires an operator-prepared setgid socket directory.
 Clients must configure the expected service UID when it differs from their own.
@@ -199,6 +200,148 @@ order is quota-only: account enablement, cooldowns, pins and active-attempt
 limits are agent-run admission state and are not applied. Like the snapshot,
 the result is an estimate at `evaluated_at`, not a reservation; a client must
 not use it as an admission fence.
+
+## Reset-credit redemption
+
+Two methods let an explicitly authorized local UID spend one banked reset credit
+from an account's [`reset_credits`](../schemas/reset-credits.json) inventory. They
+use the same transport as the reads: one newline-terminated JSON request and one
+reply per Unix socket connection, protocol `version` 1, the five-second exchange
+deadline and the 64 KiB request cap. The checked-in contract is
+[schemas/redeem.json](../schemas/redeem.json).
+
+```json
+{"version":1,"method":"redeem_reset_credit","account":"account-example","credit_id":"credit-example","request_id":"0b6f1f0e-8d0a-4c55-9d0e-2f3b6a7c8d9e"}
+{"version":1,"method":"redeem_status","request_id":"0b6f1f0e-8d0a-4c55-9d0e-2f3b6a7c8d9e"}
+```
+
+The key `op` is accepted in place of `method`. `version` is required. No other
+field may be present. `request_id` is a canonical lowercase version-4 UUID chosen
+by the client; `credit_id` is the `id` of an inventory row (1–128 bytes).
+Both methods answer with the same record:
+
+```json
+{"version":1,"result":{"request_id":"0b6f1f0e-8d0a-4c55-9d0e-2f3b6a7c8d9e","account":"account-example","credit_id":"credit-example","state":"pending","reason":null,"created_at":1763990000,"updated_at":1763990000}}
+```
+
+`created_at` and `updated_at` are integer Unix seconds; `updated_at` is the time
+of the latest state change. `reason` is null or a fixed code of `a-z0-9_`, at
+most 64 bytes; it never contains provider text. `state` is one of:
+
+| state | meaning | final |
+|---|---|---|
+| `pending` | recorded; the credential owner's launcher has not reported yet | no |
+| `redeemed` | the provider confirmed the reset | yes |
+| `rejected` | the service or the provider refused; the credit was not spent | yes |
+| `failed` | the provider was not asked to redeem (no executor, credentials, authentication) | yes |
+| `unknown` | the call may have reached the provider and its outcome is not known | see below |
+
+Authorization and errors:
+
+- Only a UID named by `serve --allow-redeem-uid` may call either method; the
+  default is none, and the service's own UID is not implied. Every other caller
+  gets `{"version":1,"error":"unauthorized"}`. A redemption UID must also be the
+  service UID or be named by `--allow-uid`, otherwise the service refuses to start
+  with `redeem_uid_not_allowed`.
+- `invalid_request`: malformed fields, an extra field, or a `request_id` that is
+  not a canonical version-4 UUID. `unknown_account`: the account is not
+  configured. `unknown_request`: `redeem_status` for an id the service does not
+  hold. `request_conflict`: the `request_id` was already used with another
+  account or credit. `storage_error`: the request was not recorded.
+- A refusal by rule is not an error. It is a stored record with
+  `state: "rejected"` and one of these reasons: `redeem_not_configured` (the
+  account has no `[sources.redeem]` binding), `redeem_in_progress` (another
+  request for the account is pending), `inventory_unknown` (no known inventory),
+  `inventory_stale` (an earlier redemption is newer than the stored inventory),
+  `credit_not_usable` (the credit is absent from the latest inventory or not
+  `usable_now: true`).
+
+Idempotency: a repeated `redeem_reset_credit` with the same `request_id`,
+account and credit returns the existing record and has no further effect, in any
+state. A client whose reply was lost must repeat the same request or call
+`redeem_status`; it must not send a new `request_id` for the same intent.
+Records are never deleted: a `request_id` stays bound to its account, credit and
+final state permanently and can never start a second redemption.
+
+The service never calls a provider and holds no credential. For a `pending`
+request it writes the trigger file `<service home>/redeem/<instance>.pending`
+(`instance` from the binding, default the account id). A root-managed
+[launcher](linux-owner-collection.md#reset-credit-redemption) then takes the
+request once, performs the provider call as the credential owner, reports the
+outcome and runs a normal collection, so `reset_credits` reflects the result.
+Poll `redeem_status` until the state is no longer `pending`; a healthy launcher
+finishes within about a minute.
+
+No outcome is retried automatically. The reasons form a closed list; the
+service accepts no other code from an executor, so a reason never carries
+provider text or any other free value:
+
+- `failed` (the provider was not asked to redeem): `executor_unavailable` (no
+  launcher took the request within 10 minutes), `trigger_unavailable`,
+  `binding_changed` (the configuration changed between admission and hand-out),
+  `owner_binding_changed` (the credential owner read a different configuration
+  than the request was admitted under), `auth_rejected` (provider answered 401
+  or 403), `profile_unavailable`, `organization_unknown`,
+  `provider_unreachable` (no connection was made), `unsupported_scope`,
+  `codex_method_unsupported`, `codex_app_server_unavailable`,
+  `redeem_script_unavailable`, `redeem_request_invalid`,
+  `redeem_not_configured`, `config_unavailable`, `clock_invalid`,
+  `owner_guard_unavailable`, `credential_unavailable`, `credential_expired`,
+  `credential_refresh_failed`, `credential_refresh_limited`,
+  `credential_refresh_unsupported_host`,
+  `credential_refresh_cleanup_unconfirmed`.
+- `rejected` by an explicit provider verdict: `already_used`, `not_limited`,
+  `cooldown`, `ineligible`, `unavailable` (Claude); `nothing_to_reset`,
+  `no_credit` (Codex). GLM documents no refusal codes, so a GLM redemption is
+  never `rejected` by the provider. `owner_rate_limited` comes from the
+  credential owner's side: it executes at most one redemption per account in
+  120 seconds.
+- `unknown`: `rate_limited` (429), `provider_conflict` (408 or 409),
+  `provider_error` (5xx), `provider_timeout`, `network_error`,
+  `provider_response_unrecognized` (any answer that is not a listed verdict,
+  including every other 4xx and contradictory or unlisted envelopes),
+  `redeem_timeout`, `redeem_script_failed`, `redeem_output_invalid`,
+  `redeem_output_contains_credential`, `executor_failed`, and
+  `outcome_unreported` (a taken request without a report after 15 minutes).
+- `redeemed` normally has a null reason. `already_redeemed` means Codex reported
+  that this idempotency key had already completed.
+
+The first verdict reported for a request is final. The single exception is a
+request that timed out as `unknown` (`outcome_unreported`): the executor's own
+verdict for that claim may still arrive and replace it. Nothing else changes
+an `unknown` state. In particular the service does not infer an outcome from
+later inventories.
+
+**Warning: `unknown` means the credit may already be spent.** Submitting a new
+`request_id` after an `unknown` result is a new redemption and can spend another
+credit. Check the provider's quota and the refreshed `reset_credits` first, and
+send a new request only if the reset demonstrably did not happen.
+
+The admission rules are applied twice: when the request is recorded and again
+when the launcher takes it. A request can therefore move from `pending` to
+`rejected` (`inventory_stale`, `credit_not_usable` or `inventory_unknown`)
+without any provider call. Each request is also pinned to the exact
+configuration revision and launcher instance it was admitted under; after any
+configuration change it ends as `failed` (`binding_changed`) instead of being
+handed out.
+
+Two further methods, `redeem_claim` and `redeem_report`, serve the launcher. Like
+`ingest`, only the service's own UID may call them. A claim carries a random
+token that the matching report must repeat; the token is never part of a record. They are not part of the
+client contract. None of the four methods is exposed as an MCP tool.
+
+The CLI client is:
+
+```bash
+agent-quota redeem --socket /absolute/quota.sock --server-uid 990 \
+  --account account-example --credit credit-example [--request-id UUID] [--wait SECONDS]
+```
+
+It generates a `request_id` when none is given, prints the record as JSON and,
+with `--wait`, polls once per second while the state is `pending`. It exits 0
+for `redeemed` or a still pending request, 2 for `rejected`, `failed` or
+`unknown`, and 1 when the service returned no record; in that case the
+`request_id` is printed to stderr for a later `redeem_status`.
 
 ## Credential-owner probe
 
