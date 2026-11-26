@@ -5,7 +5,7 @@ collector failure backoff, and quota calculations. The CLI and stdio MCP
 frontend use the read methods of a versioned Unix socket API; a read never starts a
 collector or a model. The database holds account-bound physical windows,
 per-window model membership, history, durable exhaustion latches, and the
-latest reset-credit observation per account.
+latest banked reset and paid credit balance observations per account.
 
 Configured external collectors receive a private version-1 JSON context on
 stdin. Their bounded output is validated before one SQLite transaction updates

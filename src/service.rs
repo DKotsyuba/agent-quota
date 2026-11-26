@@ -622,6 +622,7 @@ mod tests {
         let account: AccountId = "acct".parse().unwrap();
         let mut history = AccountQuotaHistory {
             reset_credits: Default::default(),
+            credit_balance: None,
             revision: 1,
             windows: vec![StoredWindow {
                 id: 1,
@@ -699,6 +700,7 @@ mod tests {
         };
         let mut history = AccountQuotaHistory {
             reset_credits: Default::default(),
+            credit_balance: None,
             revision: 1,
             windows: vec![
                 window("limiting", 20.0, 600.0, Some(1000.0)),
@@ -800,6 +802,7 @@ mod tests {
         };
         let history = AccountQuotaHistory {
             reset_credits: Default::default(),
+            credit_balance: None,
             revision: 1,
             windows: vec![window(2, 40.0, 10000.0), window(1, 100.0, 6400.0)],
             latches: vec![],
@@ -902,6 +905,7 @@ mod tests {
         let reset = f64::from_bits(1);
         let history = AccountQuotaHistory {
             reset_credits: Default::default(),
+            credit_balance: None,
             revision: 1,
             windows: vec![StoredWindow {
                 id: 1,
@@ -956,6 +960,7 @@ mod tests {
         };
         let history = AccountQuotaHistory {
             reset_credits: Default::default(),
+            credit_balance: None,
             revision: 1,
             windows: vec![
                 window(3, "early", 50.0, 10000.0, 11800.0),
@@ -1152,6 +1157,7 @@ binary = "/bin/true"
         let account: AccountId = "acct".parse().unwrap();
         let history = AccountQuotaHistory {
             reset_credits: Default::default(),
+            credit_balance: None,
             revision: 0,
             windows: Vec::new(),
             latches: Vec::new(),
@@ -1235,6 +1241,7 @@ instance = "fixture-instance"
         let snapshot = NormalizedQuotaSnapshot {
             account: account.clone(),
             models: Vec::new(),
+            credit_balance: None,
             reset_credits: ResetCreditSnapshot {
                 observed_at: Some(at),
                 inventory: ResetCredits {
@@ -1769,6 +1776,8 @@ struct LatchView {
 #[derive(Serialize)]
 struct AccountView {
     reset_credits: crate::quota::ResetCreditSnapshot,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    credit_balance: Option<crate::quota::CreditBalance>,
     account: String,
     models: Vec<ModelView>,
     windows: Vec<WindowView>,
@@ -2140,6 +2149,7 @@ fn account_view(
     let advice_key = advice::advice_key(&advice);
     Ok(AccountView {
         reset_credits: history.reset_credits,
+        credit_balance: history.credit_balance,
         account: account.as_str().to_owned(),
         models,
         windows,

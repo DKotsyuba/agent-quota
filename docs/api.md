@@ -70,6 +70,23 @@ null before any observation. The service stores one latest observation per
 account. Counts and per-credit availability describe that observation.
 Account-level credit information is included with model-filtered reads.
 
+Codex accounts can also include an optional `credit_balance` object in the
+version-2 snapshot, including model-filtered reads. It describes paid Codex
+credits usable after the plan window is exhausted. Its shape is
+`{"has_credits":true,"unlimited":false,"balance":"42.50"}`. The two flags are
+booleans from the provider. The amount is an exact decimal string or null
+when unavailable, including when the provider reports unlimited credits
+without a numeric amount. An omitted object means the provider metadata is
+unknown. A reported zero is the string `"0"` (or an equivalent decimal).
+
+Version-1 collector output accepts the same optional `credit_balance` object.
+An explicit null clears a previous balance observation when the new observation
+is at least as recent. Omitting the field supplies no observation. The shipped
+Codex collector emits null when paid-credit metadata is missing or invalid.
+Invalid amounts become null and valid flags are preserved. A failed round
+retains the last successful observation. See the [Codex 0.167.1 app-server
+protocol](https://github.com/openai/codex/blob/rust-v0.167.1/codex-rs/app-server-protocol/src/protocol/v2/account.rs#L689-L807).
+
 Version-1 collector output accepts an optional
 [`reset_credits` object](../schemas/reset-credits.json#/$defs/collector).
 Older collectors can omit the field. An omission supplies no credit observation,

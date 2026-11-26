@@ -126,7 +126,7 @@ cat >/dev/null
 remaining=$((100 - n * 10))
 if [ "$remaining" -lt 0 ]; then remaining=0; fi
 observed=$(date +%s)
-printf '{"version":1,"windows":[{"pool":"primary","window":"five_hour","models":["model-a"],"remaining_percent":%s,"observed_at":%s,"valid_until":4000000000,"reset_at":4000000000}],"reset_credits":{"known":true,"available_count":2,"credits":[{"id":"fixture-credit","provider_kind":"FIVE_HOUR","label":"Fixture credit","scope":"five_hour","resets_left":null,"usable_now":true,"granted_at":null,"expires_at":4000000000}]}}' "$remaining" "$observed"
+printf '{"version":1,"windows":[{"pool":"primary","window":"five_hour","models":["model-a"],"remaining_percent":%s,"observed_at":%s,"valid_until":4000000000,"reset_at":4000000000}],"credit_balance":{"has_credits":true,"unlimited":false,"balance":"123.4500"},"reset_credits":{"known":true,"available_count":2,"credits":[{"id":"fixture-credit","provider_kind":"FIVE_HOUR","label":"Fixture credit","scope":"five_hour","resets_left":null,"usable_now":true,"granted_at":null,"expires_at":4000000000}]}}' "$remaining" "$observed"
 "#,
     );
     std::fs::write(
@@ -196,6 +196,8 @@ source = "fixture-source"
         "model-a"
     );
     assert_eq!(second["result"]["coverage"]["state"], "complete");
+    let balance = serde_json::json!({"has_credits":true,"unlimited":false,"balance":"123.4500"});
+    assert_eq!(second["result"]["accounts"][0]["credit_balance"], balance);
     assert_eq!(
         second["result"]["accounts"][0]["reset_credits"]["available_count"],
         2
@@ -214,6 +216,7 @@ source = "fixture-source"
     assert!(output.status.success());
     let cli: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(cli["accounts"][0]["models"][0]["state"], "known");
+    assert_eq!(cli["accounts"][0]["credit_balance"], balance);
     let credits = &cli["accounts"][0]["reset_credits"];
     assert_eq!(credits["known"], true);
     assert_eq!(credits["available_count"], 2);
@@ -316,6 +319,7 @@ source = "fixture-source"
     })
     .await;
     assert_eq!(after["result"]["source_epoch"], epoch);
+    assert_eq!(after["result"]["accounts"][0]["credit_balance"], balance);
     assert_eq!(
         after["result"]["accounts"][0]["models"][0]["state"],
         "known"

@@ -466,6 +466,7 @@ mod tests {
         let snapshot = NormalizedQuotaSnapshot {
             account: account.clone(),
             models: Vec::new(),
+            credit_balance: None,
             reset_credits: ResetCreditSnapshot {
                 observed_at: Some(at),
                 inventory: ResetCredits {
