@@ -198,6 +198,45 @@ pub struct NormalizedQuotaSnapshot {
     /// Latest account-level credit observation, independent of model membership.
     #[serde(default)]
     pub reset_credits: ResetCreditSnapshot,
+    /// A paid credit balance observation, when the collector reports the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credit_balance: Option<CreditBalanceObservation>,
+}
+
+/// Account-level Codex credits usable after plan quota is exhausted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreditBalance {
+    /// Whether Codex reports credits available.
+    pub has_credits: bool,
+    /// Whether Codex reports unlimited credits.
+    pub unlimited: bool,
+    /// Exact decimal amount, if available.
+    pub balance: Option<String>,
+}
+
+/// The timestamp and nullable result of a paid balance observation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CreditBalanceObservation {
+    /// Observation time in Unix seconds.
+    pub observed_at: f64,
+    /// Provider balance metadata, if available.
+    pub value: Option<CreditBalance>,
+}
+
+impl CreditBalance {
+    /// Accepts bounded ASCII decimals without converting them to floating point.
+    fn valid_amount(amount: &str) -> bool {
+        if amount.len() > 128 {
+            return false;
+        }
+        let amount = amount.strip_prefix('-').unwrap_or(amount);
+        let digits =
+            |part: &str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
+        amount.split_once('.').map_or_else(
+            || digits(amount),
+            |(whole, fraction)| digits(whole) && digits(fraction),
+        )
+    }
 }
 
 /// One banked reset credit or grant in the provider's account inventory.
@@ -287,6 +326,17 @@ impl NormalizedQuotaSnapshot {
     /// identical facts.
     pub fn validate(&self) -> Result<()> {
         self.reset_credits.validate()?;
+        if let Some(observation) = &self.credit_balance
+            && (!observation.observed_at.is_finite()
+                || observation.observed_at < 0.0
+                || observation
+                    .value
+                    .as_ref()
+                    .and_then(|credit| credit.balance.as_deref())
+                    .is_some_and(|amount| !CreditBalance::valid_amount(amount)))
+        {
+            return Err(invalid("invalid paid credit balance observation"));
+        }
         if self.models.len() > 256 {
             return Err(invalid("too many quota models"));
         }
@@ -379,7 +429,7 @@ fn finite(value: Option<&Value>, code: &'static str) -> Result<Option<f64>> {
 /// optional `remaining_percent` (absent or null means unknown), optional
 /// `reset_at`, required `observed_at`, and optional `valid_until` defaulting
 /// to `observed_at + DEFAULT_WINDOW_TTL_SECONDS`. The envelope must declare
-/// `version` exactly `1` and may include `reset_credits`; entry keys are
+/// `version` exactly `1` and may include `reset_credits` and `credit_balance`; entry keys are
 /// closed the same way. `observed_at` may not lie in the future of `host_now`.
 /// Foreign or unconfigured models, repeated model names, duplicate or
 /// conflicting pool windows, nonfinite or out-of-range numbers, inverted
@@ -406,9 +456,12 @@ pub fn normalize_collector_output(
         .ok_or_else(|| invalid("quota_output_malformed"))?;
     if !envelope.contains_key("version")
         || envelope.get("version").and_then(Value::as_i64) != Some(1)
-        || envelope
-            .keys()
-            .any(|key| !matches!(key.as_str(), "version" | "windows" | "reset_credits"))
+        || envelope.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "version" | "windows" | "reset_credits" | "credit_balance"
+            )
+        })
     {
         return Err(invalid("quota_output_version"));
     }
@@ -578,6 +631,24 @@ pub fn normalize_collector_output(
         account: account.clone(),
         models,
         reset_credits,
+        credit_balance: envelope
+            .get("credit_balance")
+            .map(|credit| CreditBalanceObservation {
+                observed_at: observed_at.unwrap_or(host_now),
+                value: credit
+                    .get("has_credits")
+                    .and_then(Value::as_bool)
+                    .zip(credit.get("unlimited").and_then(Value::as_bool))
+                    .map(|(has_credits, unlimited)| CreditBalance {
+                        has_credits,
+                        unlimited,
+                        balance: credit
+                            .get("balance")
+                            .and_then(Value::as_str)
+                            .filter(|amount| CreditBalance::valid_amount(amount))
+                            .map(str::to_owned),
+                    }),
+            }),
     };
     snapshot.validate()?;
     Ok(snapshot)

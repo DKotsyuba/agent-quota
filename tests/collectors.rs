@@ -344,6 +344,59 @@ async fn reset_credit_fixtures_preserve_known_zero_and_provider_fields() {
     );
 }
 
+/// Covers paid balances independently of banked resets and quota windows.
+#[tokio::test]
+async fn codex_paid_credit_balance_fixtures() {
+    let assets = exported_assets();
+    let directory = assets.path().join("assets/collectors");
+    for (credits, expected) in [
+        (None, Value::Null),
+        (Some(Value::Null), Value::Null),
+        (Some(json!("invalid")), Value::Null),
+        (
+            Some(json!({"hasCredits":"true","unlimited":false,"balance":"1"})),
+            Value::Null,
+        ),
+        (
+            Some(json!({"hasCredits":true,"unlimited":false,"balance":"9007199254740993.012300"})),
+            json!({"has_credits":true,"unlimited":false,"balance":"9007199254740993.012300"}),
+        ),
+        (
+            Some(json!({"hasCredits":false,"unlimited":false,"balance":"0"})),
+            json!({"has_credits":false,"unlimited":false,"balance":"0"}),
+        ),
+        (
+            Some(json!({"hasCredits":true,"unlimited":true,"balance":null})),
+            json!({"has_credits":true,"unlimited":true,"balance":null}),
+        ),
+        (
+            Some(json!({"hasCredits":true,"unlimited":false,"balance":10})),
+            json!({"has_credits":true,"unlimited":false,"balance":null}),
+        ),
+        (
+            Some(json!({"hasCredits":true,"unlimited":false,"balance":"12\n"})),
+            json!({"has_credits":true,"unlimited":false,"balance":null}),
+        ),
+    ] {
+        let bucket = json!({"primary":{"usedPercent":25,"windowDurationMins":300}});
+        let mut input = json!({"result":{"rateLimitsByLimitId":{"codex":bucket,"dedicated":{
+            "credits":{"hasCredits":true,"unlimited":false,"balance":"999"}
+        }}}});
+        if let Some(credits) = credits {
+            input["result"]["rateLimitsByLimitId"]["codex"]["credits"] = credits;
+        }
+        let (ok, result) = collector_filter(&directory, "codex", &input.to_string()).await;
+        assert!(ok, "{input}");
+        assert_eq!(result["windows"].as_array().unwrap().len(), 1);
+        assert_eq!(result["credit_balance"], expected, "{input}");
+    }
+    let primary = json!({"rateLimits":{"primary":{"usedPercent":25,"windowDurationMins":300},
+        "credits":{"hasCredits":true,"unlimited":false,"balance":"42.50"}}});
+    let (ok, result) = collector_filter(&directory, "codex", &primary.to_string()).await;
+    assert!(ok);
+    assert_eq!(result["credit_balance"]["balance"], "42.50");
+}
+
 /// Builds an OpenCode Go usage body from per-window (status, percent) JSON fragments.
 fn opencode_go_body(rolling: &str, weekly: &str, monthly: &str) -> String {
     format!(r#"{{"usage":{{"rolling":{rolling},"weekly":{weekly},"monthly":{monthly}}}}}"#)

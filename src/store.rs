@@ -5,8 +5,8 @@
 //! to interpret every durable latch survives retention.
 
 use crate::quota::{
-    AccountId, NormalizedQuotaSnapshot, PhysicalQuotaKey, QuotaError, QuotaModelObservation,
-    QuotaWindow, ResetCreditSnapshot, ResetCredits,
+    AccountId, CreditBalance, NormalizedQuotaSnapshot, PhysicalQuotaKey, QuotaError,
+    QuotaModelObservation, QuotaWindow, ResetCreditSnapshot, ResetCredits,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 
@@ -148,6 +148,8 @@ pub struct AccountQuotaHistory {
     pub latches: Vec<ExhaustionLatch>,
     /// Last account-level credit observation or the unobserved default.
     pub reset_credits: ResetCreditSnapshot,
+    /// Last available paid credit balance metadata.
+    pub credit_balance: Option<CreditBalance>,
 }
 
 /// An owned SQLite connection to this application's versioned quota database.
@@ -310,7 +312,10 @@ impl QuotaStore {
         tx.execute_batch(
             "CREATE TABLE IF NOT EXISTS quota_reset_credits (\
              account_id TEXT PRIMARY KEY NOT NULL REFERENCES provider_accounts(account_id),\
-             observed_at REAL NOT NULL, inventory_json TEXT NOT NULL);",
+             observed_at REAL NOT NULL, inventory_json TEXT NOT NULL);\
+             CREATE TABLE IF NOT EXISTS quota_credit_balance (\
+             account_id TEXT PRIMARY KEY NOT NULL REFERENCES provider_accounts(account_id),\
+             observed_at REAL NOT NULL, balance_json TEXT NOT NULL);",
         )?;
         Self::redeem_schema(&tx)?;
         tx.commit()?;
@@ -364,7 +369,7 @@ impl QuotaStore {
         record_quota_snapshot_on(&mut self.conn, runtime, snapshot, retention, at)
     }
 
-    /// Reads one account's history, latches, reset credits and revision in a single snapshot.
+    /// Reads one account's history, latches, credit observations and revision in a single snapshot.
     ///
     /// # Errors
     /// Returns a SQLite error if the database cannot be read.
@@ -441,12 +446,25 @@ impl QuotaStore {
         } else {
             ResetCreditSnapshot::default()
         };
+        let paid_balance: Option<String> = tx
+            .query_row(
+                "SELECT balance_json FROM quota_credit_balance WHERE account_id=?",
+                [account.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let credit_balance = paid_balance
+            .map(|json| serde_json::from_str::<Option<CreditBalance>>(&json))
+            .transpose()
+            .map_err(|_| invalid("invalid stored paid credit balance"))?
+            .flatten();
         tx.commit()?;
         Ok(AccountQuotaHistory {
             revision,
             windows,
             latches,
             reset_credits,
+            credit_balance,
         })
     }
 }
@@ -789,6 +807,16 @@ fn record_quota_snapshot_on(
         }
     }
     let mut mutations = 0usize;
+    if let Some(credit) = &snapshot.credit_balance {
+        let balance = serde_json::to_string(&credit.value)
+            .map_err(|_| invalid("invalid paid credit balance"))?;
+        mutations += tx.execute(
+            "INSERT INTO quota_credit_balance(account_id,observed_at,balance_json) VALUES(?,?,?) \
+             ON CONFLICT(account_id) DO UPDATE SET observed_at=excluded.observed_at,balance_json=excluded.balance_json \
+             WHERE excluded.observed_at >= quota_credit_balance.observed_at",
+            params![account.as_str(), credit.observed_at, balance],
+        )?;
+    }
     if let Some(observed_at) = snapshot.reset_credits.observed_at {
         let inventory = serde_json::to_string(&snapshot.reset_credits.inventory)
             .map_err(|_| invalid("invalid reset credit inventory"))?;
@@ -1004,6 +1032,52 @@ mod tests {
             QuotaStore::open(&fifo),
             Err(StoreError::ForeignDatabase)
         ));
+        Ok(())
+    }
+
+    /// A newer explicit unknown survives replay of an older paid balance.
+    #[test]
+    fn paid_credit_balance_clears_without_accepting_stale_replays()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let dir = private_dir()?;
+        let mut store = QuotaStore::open(&dir.path().join("quota.sqlite"))?;
+        let account: AccountId = "account".parse()?;
+        store.register_account(&account)?;
+        let scope = CollectorScope {
+            runtime: "codex".into(),
+            source: "codex".into(),
+            models: BTreeSet::new(),
+        };
+        let parse = |value, at| {
+            normalize_collector_output(
+                &account,
+                &scope,
+                &json!({"version":1,"windows":[],"credit_balance":value}),
+                at,
+                256,
+                256,
+            )
+        };
+        let known = parse(
+            json!({"has_credits":false,"unlimited":false,"balance":"0"}),
+            100.0,
+        )?;
+        store.record_snapshot("codex", &known, 20, 100.0)?;
+        assert_eq!(
+            store
+                .read_account(&account)?
+                .credit_balance
+                .as_ref()
+                .and_then(|credit| credit.balance.as_deref()),
+            Some("0")
+        );
+        let unknown = parse(
+            json!({"has_credits":"invalid","unlimited":false,"balance":0}),
+            200.0,
+        )?;
+        store.record_snapshot("codex", &unknown, 20, 200.0)?;
+        store.record_snapshot("codex", &known, 20, 200.0)?;
+        assert_eq!(store.read_account(&account)?.credit_balance, None);
         Ok(())
     }
 

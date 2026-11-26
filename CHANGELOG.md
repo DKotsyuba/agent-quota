@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Added
+
+- Expose the optional Codex paid credit balance per account in socket snapshots
+  and CLI JSON, preserving its exact decimal representation and unknown state.
+
 ## 0.3.0
 
 Dated 2026-11-24.

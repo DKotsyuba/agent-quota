@@ -27,6 +27,18 @@ def codex_credits:
         (if all(.[]; .usable_now != null) then map(select(.usable_now)) | length else null end)), credits:.}
   ) catch unknown_credits;
 
+# Read the account balance from the primary Codex snapshot, never a model-specific bucket.
+def codex_credit_balance:
+  try (
+    (.rateLimits.credits // .rateLimitsByLimitId.codex.credits) as $credits
+    | if ($credits.hasCredits | type) != "boolean" or ($credits.unlimited | type) != "boolean"
+      then null
+      else {has_credits:$credits.hasCredits, unlimited:$credits.unlimited,
+            balance:($credits.balance | if type == "string" and length <= 128
+                and test("\\A-?[0-9]+(\\.[0-9]+)?\\z") then . else null end)}
+      end
+  ) catch null;
+
 # Dedicated model buckets constrain only exact token-matching native model names.
 (.result // .) as $response
 | (if ($response.rateLimitsByLimitId | type) == "object" then $response.rateLimitsByLimitId
@@ -51,3 +63,4 @@ def codex_credits:
     | {pool:$membership.id, window:(.windowDurationMins | window_name), models:$membership.models,
        remaining_percent:(100-$used), reset_at:.resetsAt, observed_at:$ctx.now}
   ] | envelope | .reset_credits = ($response | codex_credits)
+  | .credit_balance = ($response | codex_credit_balance)
