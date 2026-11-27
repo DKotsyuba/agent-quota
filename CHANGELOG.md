@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.4.1
+
 ### Changed
 
 - Paid credit balances are shown rounded to two decimals without a currency sign;
