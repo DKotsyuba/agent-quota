@@ -70,3 +70,10 @@ on dobi only (see the dobi verification section of the integration design).
 Automatic Agent Bridge warning delivery is deferred. Existing
 quota history is intentionally not imported. See
 [integration design](quota-integration.md) for the remaining scope.
+
+The MCP frontend reads the authenticated service version at legacy initialization
+and before tool calls, at most once per 30 seconds per frontend. A confirmed
+mismatch invalidates the advertised tool list once and rejects calls with
+reconnect instructions until the host launches a fresh frontend. A service
+that omits its version has unknown version compatibility. Doctor reports both
+versions when available and treats confirmed skew as unready.

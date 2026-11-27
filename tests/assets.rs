@@ -54,7 +54,7 @@ fn export_and_verify_embedded_assets() {
         String::from_utf8_lossy(&exported.stderr)
     );
     let report: serde_json::Value = serde_json::from_slice(&exported.stdout).unwrap();
-    assert_eq!(report["files"], 19);
+    assert_eq!(report["files"], 21);
     assert_eq!(report["verified"], true);
     let codex = directory.join("collectors/codex.sh");
     assert_eq!(
@@ -68,6 +68,20 @@ fn export_and_verify_embedded_assets() {
     assert_eq!(
         fs::read(directory.join("systemd/agent-quota-owner-collect@.service")).unwrap(),
         include_bytes!("../scripts/systemd/agent-quota-owner-collect@.service")
+    );
+    let unit = fs::read_to_string(directory.join("systemd/agent-quota.service")).unwrap();
+    assert!(unit.contains("User=quota-service\n") && unit.contains("StateDirectory=agent-quota\n"));
+    assert!(
+        unit.lines()
+            .filter_map(|line| line.strip_prefix("ExecStartPre="))
+            .all(|command| command.starts_with("/usr/bin/mkdir "))
+    );
+    let rule = fs::read_to_string(directory.join("systemd/agent-quota-tmpfiles.conf")).unwrap();
+    assert_eq!(
+        rule.lines()
+            .filter(|line| !line.starts_with('#'))
+            .collect::<Vec<_>>(),
+        ["d /run/agent-quota 2710 quota-service quota-service -"]
     );
     assert!(
         assets_command("verify-assets", &directory, root.path())

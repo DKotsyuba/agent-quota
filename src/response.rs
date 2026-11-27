@@ -24,22 +24,34 @@ impl Templates {
         Ok(Self { env })
     }
     pub fn render<T: Serialize>(&self, name: &str, view: &T) -> Result<String, &'static str> {
-        let mut writer = Limit(Vec::new());
+        let mut writer = Limit::default();
         self.env
             .get_template(name)
             .map_err(|_| "template_missing")?
             .render_captured_to(view, &mut writer)
-            .map_err(|_| "presentation_failed")?;
-        String::from_utf8(writer.0).map_err(|_| "presentation_encoding")
+            .map_err(|_| {
+                if writer.exceeded {
+                    "response_too_large"
+                } else {
+                    "presentation_failed"
+                }
+            })?;
+        String::from_utf8(writer.bytes).map_err(|_| "presentation_encoding")
     }
 }
-struct Limit(Vec<u8>);
+/// Discards over-budget output and preserves the cause for narrowing guidance.
+#[derive(Default)]
+struct Limit {
+    bytes: Vec<u8>,
+    exceeded: bool,
+}
 impl Write for Limit {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if self.0.len().saturating_add(bytes.len()) > 8192 {
+        if self.bytes.len().saturating_add(bytes.len()) > 8192 {
+            self.exceeded = true;
             return Err(io::Error::other("response limit"));
         }
-        self.0.extend_from_slice(bytes);
+        self.bytes.extend_from_slice(bytes);
         Ok(bytes.len())
     }
     fn flush(&mut self) -> io::Result<()> {
@@ -58,9 +70,9 @@ mod tests {
     #[test]
     fn cap_discards_output() {
         let r = Templates::new(&[("test", "{{ data }}")]).unwrap();
-        assert!(
-            r.render("test", &serde_json::json!({"data":"x".repeat(8193)}))
-                .is_err()
+        assert_eq!(
+            r.render("test", &serde_json::json!({"data":"x".repeat(8193)})),
+            Err("response_too_large")
         );
     }
 }

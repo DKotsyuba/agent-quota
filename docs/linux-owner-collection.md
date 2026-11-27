@@ -189,3 +189,41 @@ real Codex quota metadata. Real GLM logins, other hosts and macOS Keychain
 behavior remain unverified.
 Do not remove an existing Run launcher or change its live paths until the
 operator has reviewed and verified the replacement for that deployment.
+
+## Resident service startup migration
+
+The exported [resident unit](../scripts/systemd/agent-quota.service) and
+[tmpfiles rule](../scripts/systemd/agent-quota-tmpfiles.conf) are examples for
+the administrator. The unit gives systemd ownership of the private state
+directory at `/var/lib/agent-quota`. The only preparation within that
+directory runs as `quota-service`. Tmpfiles prepares the shared socket
+directory directly under root-owned `/run`; its setgid bit preserves the
+socket group. The service still authorizes every peer by UID.
+
+For an installed system unit, arrange an administrator maintenance window.
+
+1. Review the effective unit and drop-ins using `systemctl cat agent-quota.service`.
+   Record the binary, configuration, state and socket paths, socket group, and
+   the existing `--allow-uid` and `--allow-redeem-uid` arguments. Stop the
+   resident unit and any timer or path units that could trigger it during migration.
+2. Check that the existing state directory is a real, service-owned directory
+   at mode `0700` under root-controlled ancestors. Preserve the database and
+   configuration. Inspect any unexpected symlinks before reuse. Use
+   `StateDirectory=agent-quota` and `StateDirectoryMode=0700` for the example
+   state path. Remove privileged directory creation from the unit and its
+   drop-ins, including any `ExecStartPre=+` or equivalent privileged override
+   for service-writable paths. Prepare the private temporary subdirectory as
+   the service user.
+3. Update `/etc/tmpfiles.d/agent-quota.conf` to contain only the required
+   socket-directory rule for this service. The example uses
+   `d /run/agent-quota 2710 quota-service quota-service -`. Substitute the
+   installed service user and client group. Keep the socket directory under
+   a root-owned, non-writable parent. Remove old privileged rules below the
+   state or socket directory. Preserve the socket path and allowlists where
+   possible. If a path changes, update client, hook and owner launcher settings.
+4. Apply the reviewed tmpfiles rule with
+   `systemd-tmpfiles --create /etc/tmpfiles.d/agent-quota.conf`, then run
+   `systemctl daemon-reload` and start the service. Check the effective unit,
+   directory owners and modes, then run `agent-quota doctor --json` with
+   the installed socket and expected service UID. Verify a read from an
+   allowlisted client before resuming the associated timers and paths.

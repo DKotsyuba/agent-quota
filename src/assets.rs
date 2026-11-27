@@ -105,6 +105,18 @@ const ASSETS: &[Asset] = &[
     },
     Asset {
         directory: "systemd",
+        name: "agent-quota.service",
+        bytes: include_bytes!("../scripts/systemd/agent-quota.service"),
+        executable: false,
+    },
+    Asset {
+        directory: "systemd",
+        name: "agent-quota-tmpfiles.conf",
+        bytes: include_bytes!("../scripts/systemd/agent-quota-tmpfiles.conf"),
+        executable: false,
+    },
+    Asset {
+        directory: "systemd",
         name: "agent-quota-owner-collect.sh",
         bytes: include_bytes!("../scripts/systemd/agent-quota-owner-collect.sh"),
         executable: true,

@@ -416,13 +416,74 @@ fn display_fact(value: Option<impl ToString>) -> String {
     value.map_or_else(|| "unknown".into(), |value| value.to_string())
 }
 
+/// Gives the available filters even when the service cannot supply candidate examples.
+pub(crate) async fn narrowing_message(
+    socket: &Path,
+    server_uid: u32,
+    account_scope: bool,
+    cli: bool,
+) -> String {
+    let request = crate::ipc::Request {
+        version: 1,
+        method: "scope_options".into(),
+        ..Default::default()
+    };
+    let options = match crate::ipc::request(socket, &request, server_uid).await {
+        Ok(crate::ipc::Reply::Result { result, .. }) => result,
+        _ => Value::Null,
+    };
+    let candidates = |key: &str, more: &str| {
+        let Some(values) = options[key].as_array() else {
+            return "unavailable".into();
+        };
+        let parts: Vec<_> = values
+            .iter()
+            .take(crate::ipc::SCOPE_SAMPLE_SIZE)
+            .filter_map(Value::as_str)
+            .filter(|value| !value.chars().any(char::is_control))
+            .filter_map(|value| quoted(value).ok())
+            .collect();
+        if parts.is_empty() {
+            return "none".into();
+        }
+        let suffix = if options[more] == true || values.len() > crate::ipc::SCOPE_SAMPLE_SIZE {
+            ", …"
+        } else {
+            ""
+        };
+        format!("{}{suffix}", parts.join(", "))
+    };
+    let (account, model) = if cli {
+        ("--account", "--model")
+    } else {
+        ("accounts", "model")
+    };
+    let models = candidates("models", "more_models");
+    if account_scope {
+        let accounts = candidates("accounts", "more_accounts");
+        format!(
+            "response_too_large: narrow with {account} (candidates: {accounts}) or {model} (candidates: {models})."
+        )
+    } else {
+        format!("response_too_large: narrow with {model} (candidates: {models}).")
+    }
+}
+
+/// Reports oversized MCP results using the filters supported by the called tool.
+async fn scoped_error(code: &str, socket: &Path, uid: u32, accounts: bool) -> CallToolResult {
+    if code != "response_too_large" {
+        return quota_error(code);
+    }
+    let message = narrowing_message(socket, uid, accounts, false).await;
+    CallToolResult::error(vec![ContentBlock::text(format!("ERROR {message}\n"))])
+}
+
 /// Returns one fixed error without exposing socket paths or raw provider data.
 fn quota_error(code: &str) -> CallToolResult {
     let text = match code {
         "invalid_arguments" => {
             "ERROR invalid_arguments: provide valid accounts and an optional model.\n"
         }
-        "response_too_large" => "ERROR response_too_large: narrow the account or model scope.\n",
         "history_too_large" => {
             "ERROR history_too_large: the account history exceeds the service read budget; contact the operator.\n"
         }
@@ -473,15 +534,17 @@ async fn quota_reply(
     };
     let value = match crate::ipc::request(socket, &request, server_uid).await {
         Ok(crate::ipc::Reply::Result { result, .. }) => result,
-        Ok(crate::ipc::Reply::Error { error, .. }) | Err(error) => return quota_error(&error),
+        Ok(crate::ipc::Reply::Error { error, .. }) | Err(error) => {
+            return scoped_error(&error, socket, server_uid, true).await;
+        }
     };
     let view = match quota_view(value, args.model.as_deref()) {
         Ok(view) => view,
-        Err(code) => return quota_error(code),
+        Err(code) => return scoped_error(code, socket, server_uid, true).await,
     };
     match templates.render("quota", &view) {
         Ok(text) => CallToolResult::success(vec![ContentBlock::text(text)]),
-        Err(_) => quota_error("presentation_failed"),
+        Err(code) => scoped_error(code, socket, server_uid, true).await,
     }
 }
 
@@ -681,15 +744,17 @@ async fn capacity_reply(
     };
     let value = match crate::ipc::request(socket, &request, server_uid).await {
         Ok(crate::ipc::Reply::Result { result, .. }) => result,
-        Ok(crate::ipc::Reply::Error { error, .. }) | Err(error) => return quota_error(&error),
+        Ok(crate::ipc::Reply::Error { error, .. }) | Err(error) => {
+            return scoped_error(&error, socket, server_uid, false).await;
+        }
     };
     let page = match capacity_view(value) {
         Ok(page) => page,
-        Err(code) => return quota_error(code),
+        Err(code) => return scoped_error(code, socket, server_uid, false).await,
     };
     match templates.render("capacity", &page) {
         Ok(text) => CallToolResult::success(vec![ContentBlock::text(text)]),
-        Err(_) => quota_error("presentation_failed"),
+        Err(code) => scoped_error(code, socket, server_uid, false).await,
     }
 }
 
