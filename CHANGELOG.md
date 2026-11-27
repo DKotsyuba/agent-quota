@@ -7,6 +7,15 @@
 - Expose the optional Codex paid credit balance per account in socket snapshots
   and CLI JSON, preserving its exact decimal representation and unknown state.
 
+### Changed
+
+- Rank provider capacity with usable banked resets and available Codex paid
+  credits, while preserving the plan's status and window priority in the local API.
+- Show all model windows, UTC resets, rounded percentages, stale evidence and
+  risk reasons in quota text. Show the paid Codex balance in `get_quota`.
+- Inject quota context on the first prompt and significant changes per host
+  session. The `SessionStart` hook refreshes context after compact, clear or resume.
+
 ## 0.3.0
 
 Dated 2026-11-24.

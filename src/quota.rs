@@ -224,8 +224,13 @@ pub struct CreditBalanceObservation {
 }
 
 impl CreditBalance {
+    /// Whether the provider reports paid credit capacity.
+    pub(crate) fn available(&self) -> bool {
+        self.has_credits || self.unlimited
+    }
+
     /// Accepts bounded ASCII decimals without converting them to floating point.
-    fn valid_amount(amount: &str) -> bool {
+    pub(crate) fn valid_amount(amount: &str) -> bool {
         if amount.len() > 128 {
             return false;
         }

@@ -254,6 +254,7 @@ source = "fixture-source"
     let text = wire["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("model-a"));
     assert!(text.contains("reset credits: known | available count: 2"));
+    assert!(text.contains("paid credits: $123.4500"));
     assert!(text.contains("\"fixture-credit\""));
     let capacity = client
         .call_tool(CallToolRequestParams::new("get_capacity"))
@@ -294,8 +295,9 @@ source = "fixture-source"
     let context = envelope["hookSpecificOutput"]["additionalContext"]
         .as_str()
         .unwrap();
-    assert!(context.starts_with("Provider capacity order (highest first; read-only"));
-    assert!(context.ends_with("1. provider=\"codex\"; models=[\"model-a\":available]"));
+    assert!(context.starts_with("Quota update · provider capacity order"));
+    assert!(context.contains("\ncodex: 5h "));
+    assert!(context.ends_with("model-a available +reset credit +credits $123.4500"));
     write_script(&script, "#!/bin/sh\ncat >/dev/null\nexit 7\n");
     let failed = wait_for(&socket, "status", |value| {
         value["result"]["last_collection"]["sources"][0]["status"] == "failed"
@@ -641,4 +643,109 @@ async fn hook_context_is_silent_without_service() {
         .unwrap();
     assert!(relative.status.success());
     assert!(relative.stdout.is_empty());
+}
+
+/// Host lifecycle handling uses the real CLI, and SessionStart needs no live socket.
+#[tokio::test]
+async fn hook_context_reinjects_only_for_changed_session_context() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let socket = root.path().join("q.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let make_capacity = |status: &str, remaining: f64| {
+        json!({"version":1,"result":{"schema_version":1,"evaluated_at":1000.0,
+        "coverage":{"state":"complete"},"providers":[{"provider":"codex","models":[{
+            "model":"gpt","status":status,"windows":[{
+                "source":"synthetic","window":"five_hour","known":true,
+                "remaining_percent":remaining,"reset_at":2000.0
+            }]
+        }]}]}})
+    };
+    let server = tokio::spawn(async move {
+        for result in [
+            make_capacity("available", 63.0),
+            make_capacity("available", 69.0),
+            make_capacity("available", 70.0),
+            make_capacity("limited", 70.0),
+            make_capacity("limited", 70.0),
+            make_capacity("limited", 70.0),
+            make_capacity("limited", 70.0),
+        ] {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            stream.read_line(&mut line).await.unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(&line).unwrap()["method"],
+                "capacity"
+            );
+            stream
+                .write_all(format!("{result}\n").as_bytes())
+                .await
+                .unwrap();
+        }
+    });
+    let run = |host, path: PathBuf, input: &'static [u8]| {
+        let base = root.path().to_owned();
+        async move {
+            let mut child = Command::new(binary())
+                .args(["hook", "context", "--host", host, "--socket"])
+                .arg(path)
+                .env("XDG_STATE_HOME", base)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            child.stdin.take().unwrap().write_all(input).await.unwrap();
+            let output = child.wait_with_output().await.unwrap();
+            assert!(output.status.success() && output.stderr.is_empty());
+            String::from_utf8(output.stdout).unwrap()
+        }
+    };
+    let prompt = br#"{"session_id":"example","hook_event_name":"UserPromptSubmit"}"#;
+    assert!(
+        run("codex", socket.clone(), prompt)
+            .await
+            .contains("5h 63%")
+    );
+    assert!(run("codex", socket.clone(), prompt).await.is_empty());
+    assert!(
+        run("codex", socket.clone(), prompt)
+            .await
+            .contains("5h 70%")
+    );
+    assert!(
+        run("codex", socket.clone(), prompt)
+            .await
+            .contains("gpt limited")
+    );
+    let compact =
+        br#"{"session_id":"example","hook_event_name":"SessionStart","source":"compact"}"#;
+    assert!(
+        run("codex", root.path().join("absent.sock"), compact)
+            .await
+            .is_empty()
+    );
+    assert!(
+        run("codex", socket.clone(), prompt)
+            .await
+            .contains("gpt limited")
+    );
+    assert!(
+        run("claude", socket.clone(), prompt)
+            .await
+            .contains("Quota update")
+    );
+    assert!(
+        run("codex", socket, b"invalid json")
+            .await
+            .contains("Quota update")
+    );
+    tokio::time::timeout(Duration::from_secs(1), server)
+        .await
+        .unwrap()
+        .unwrap();
 }

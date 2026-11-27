@@ -44,6 +44,8 @@ priority_multiplier = 2.0   # account weight for this provider binding
 [providers.codex-plus]      # must name a configured source provider
 priority_multiplier = 5.0   # provider weight
 ordered_accounts = false    # true: account weights are a fallback order, ranked neutrally
+reset_credit_floor = 0.25   # default unweighted floor for a usable banked reset
+paid_credit_bonus = 0.5     # default unweighted bonus for available Codex paid credits
 ```
 
 Mapping from an agent-run schema-2 provider configuration:
@@ -61,6 +63,12 @@ source; one without a collector uses `limits_source = "none"` and stays
 `unknown`. Changing a weight changes the configuration revision, so coverage is
 `partial` until the next completed collection round under that revision. The
 weights affect only the capacity order; collection and `get_quota` are unchanged.
+
+Both credit settings accept numbers from `0.0` to `2.0`. The reset floor is
+applied before the historical reset multiplier `1 + n/(n + 1)`; a zero floor
+keeps that multiplier on positive plan scores. A zero paid bonus removes the
+paid-credit increase. These settings affect the order reported by
+`capacity`, `get_capacity` and the hook. They do not authorize credit spending.
 
 ## Reset-credit redemption
 
