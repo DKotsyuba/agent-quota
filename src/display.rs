@@ -111,7 +111,7 @@ pub(crate) fn reason(
     }
 }
 
-/// Preserves the paid balance's provider-supplied decimal and availability.
+/// Shows the paid credit balance rounded to two decimals; credits are not a currency.
 pub(crate) fn paid(credit: &CreditBalance) -> String {
     let amount = credit
         .balance
@@ -128,7 +128,11 @@ pub(crate) fn paid(credit: &CreditBalance) -> String {
                     "unavailable".into()
                 }
             },
-            |amount| format!("${amount}"),
+            |amount| {
+                amount
+                    .parse::<f64>()
+                    .map_or_else(|_| amount.to_owned(), |value| format!("{value:.2}"))
+            },
         )
     };
     if !credit.available() && amount.is_some() {

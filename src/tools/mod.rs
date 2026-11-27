@@ -861,7 +861,7 @@ mod tests {
                 "\"personal\" | \"codex\" | \"gpt\" | limited: 7d window 63% left, burn 20.0%/h → runs out before reset\n",
                 "  5h | 64% | burn 6.5%/h | reset 27.11 18:11 UTC (in 1h)\n",
                 "  7d | 63% | burn 20.0%/h | reset 03.12 20:59 UTC (in 6d 4h)\n",
-                "\"personal\" | reset credits: unknown | available count: unknown | paid credits: $42.50\n",
+                "\"personal\" | reset credits: unknown | available count: unknown | paid credits: 42.50\n",
             )
         );
         let order = renderer
@@ -872,7 +872,7 @@ mod tests {
             concat!(
                 "Capacity order at 27.11 16:59 UTC | coverage: complete\n",
                 "1. \"codex\" | status: limited | score: 0.53\n",
-                "   \"gpt\" | limited: 7d window 63% left, burn 20.0%/h → runs out before reset | +reset credit | +credits $42.50\n",
+                "   \"gpt\" | limited: 7d window 63% left, burn 20.0%/h → runs out before reset | +reset credit | +credits 42.50\n",
                 "     5h | 64% | burn 6.5%/h | reset 27.11 18:11 UTC (in 1h)\n",
                 "     7d | 63% | burn 20.0%/h | reset 03.12 20:59 UTC (in 6d 4h)\n",
             )

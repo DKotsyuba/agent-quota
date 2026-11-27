@@ -257,7 +257,7 @@ source = "fixture-source"
     let text = wire["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("model-a"));
     assert!(text.contains("reset credits: known | available count: 2"));
-    assert!(text.contains("paid credits: $123.4500"));
+    assert!(text.contains("paid credits: 123.45"));
     assert!(text.contains("\"fixture-credit\""));
     let capacity = client
         .call_tool(CallToolRequestParams::new("get_capacity"))
@@ -300,7 +300,7 @@ source = "fixture-source"
         .unwrap();
     assert!(context.starts_with("Quota update · provider capacity order"));
     assert!(context.contains("\ncodex: 5h "));
-    assert!(context.ends_with("model-a available +reset credit +credits $123.4500"));
+    assert!(context.ends_with("model-a available +reset credit +credits 123.45"));
     write_script(&script, "#!/bin/sh\ncat >/dev/null\nexit 7\n");
     let failed = wait_for(&socket, "status", |value| {
         value["result"]["last_collection"]["sources"][0]["status"] == "failed"
