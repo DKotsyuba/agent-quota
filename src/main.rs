@@ -7,7 +7,9 @@ mod collector;
 mod config;
 mod credentials;
 mod delegated;
+mod display;
 mod forecast;
+mod hook;
 mod ipc;
 mod process;
 mod quota;
@@ -212,8 +214,8 @@ enum Commands {
 enum HookCommand {
     /// Print the provider capacity order for a `UserPromptSubmit` hook.
     ///
-    /// Read-only and stateless: one bounded capacity read from the local
-    /// service socket. Always exits 0 and prints nothing on any error.
+    /// Reads quota once and emits a context update only when it changes for
+    /// the calling session. SessionStart can invalidate the last update.
     Context {
         /// Host harness; both consume the same `additionalContext` envelope.
         #[arg(long, default_value = "claude")]
@@ -237,7 +239,7 @@ enum Host {
     Codex,
 }
 
-/// Overall deadline for the hook's service read; a slow service yields no context.
+/// Overall input and service-read deadline; a slow service yields no context.
 const HOOK_READ_DEADLINE: std::time::Duration = std::time::Duration::from_millis(750);
 
 #[derive(Subcommand)]
@@ -508,14 +510,44 @@ async fn read_service(
     }
 }
 
-/// Reads the capacity order once and renders the compact hook block; any failure is empty.
+/// Handles host lifecycle input and performs at most one deadline-bounded capacity read.
 async fn hook_context(
+    host: Host,
     socket: Option<PathBuf>,
     server_uid: Option<u32>,
     max_chars: usize,
-) -> String {
+) {
+    let deadline = tokio::time::Instant::now() + HOOK_READ_DEADLINE;
+    let input = {
+        use std::io::IsTerminal;
+        let stdin = std::io::stdin();
+        if stdin.is_terminal() {
+            Vec::new()
+        } else {
+            read_bounded(
+                &mut stdin.lock(),
+                1024 * 1024,
+                std::time::Duration::from_millis(75),
+            )
+            .unwrap_or_default()
+        }
+    };
+    let host = match host {
+        Host::Claude => "claude",
+        Host::Codex => "codex",
+    };
+    let key = match hook::event(host, &input) {
+        hook::Event::Prompt(key) => key,
+        hook::Event::Invalidate(key) => {
+            if let Some(base) = hook::state_home() {
+                let _ = hook::invalidate(&base, key);
+            }
+            return;
+        }
+        hook::Event::Ignore => return,
+    };
     let Ok(path) = socket_path(socket) else {
-        return String::new();
+        return;
     };
     let request = ipc::Request {
         version: 1,
@@ -526,9 +558,23 @@ async fn hook_context(
         ..Default::default()
     };
     let uid = server_uid.unwrap_or_else(ipc::owner_uid);
-    match tokio::time::timeout(HOOK_READ_DEADLINE, ipc::request(&path, &request, uid)).await {
-        Ok(Ok(ipc::Reply::Result { result, .. })) => capacity::hook_text(result, max_chars),
-        _ => String::new(),
+    if let Ok(Ok(ipc::Reply::Result { result, .. })) =
+        tokio::time::timeout_at(deadline, ipc::request(&path, &request, uid)).await
+        && let Some(block) = capacity::hook_block(result, max_chars)
+        && tokio::time::Instant::now() < deadline
+    {
+        if let Some(key) = key {
+            if let Some(base) = hook::state_home() {
+                let _ = hook::inject(&base, key, block, |text| {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(std::io::ErrorKind::TimedOut.into());
+                    }
+                    print_context(text)
+                });
+            }
+        } else {
+            let _ = print_context(&block.text);
+        }
     }
 }
 
@@ -538,12 +584,12 @@ async fn hook_context(
     clippy::print_stdout,
     reason = "Explicit hook branch, never MCP output"
 )]
-fn print_context(text: &str) {
+fn print_context(text: &str) -> std::io::Result<()> {
     use std::io::Write;
     let envelope = serde_json::json!({
         "hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": text}
     });
-    let _ = writeln!(std::io::stdout().lock(), "{envelope}");
+    writeln!(std::io::stdout().lock(), "{envelope}")
 }
 
 /// Reads a bounded worker envelope from stdin and submits it once to the owner-only endpoint.
@@ -926,17 +972,14 @@ async fn main() -> ExitCode {
         Commands::Hook {
             command:
                 HookCommand::Context {
-                    host: _,
+                    host,
                     socket,
                     server_uid,
                     max_chars,
                 },
         } => {
             // The hook must never break the host: every outcome is a silent exit 0.
-            let text = hook_context(socket, server_uid, max_chars).await;
-            if !text.is_empty() {
-                print_context(&text);
-            }
+            hook_context(host, socket, server_uid, max_chars).await;
             ExitCode::SUCCESS
         }
         Commands::ServiceStatus { socket, server_uid } => {

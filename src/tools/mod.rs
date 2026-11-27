@@ -1,5 +1,10 @@
 //! Authoritative Rust tool registry. JSON discovery is an exported snapshot, not a second source.
-use crate::{quota::ResetCreditSnapshot, response::Templates};
+use crate::{
+    capacity::{self, RankingCredits, SnapshotWindow, WindowView},
+    display,
+    quota::{CreditBalance, ResetCreditSnapshot},
+    response::Templates,
+};
 use mcp_presentation::Renderer;
 use rmcp::model::{CallToolResult, ContentBlock};
 use serde::{Deserialize, Serialize};
@@ -12,10 +17,10 @@ pub fn definitions() -> Vec<Value> {
         json!({"name":"get_status", "description":"Report the product name, version and release qualification. Read-only; does not access files or external services.",
         "inputSchema":{"type":"object","properties":{},"additionalProperties":false},
         "annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}}),
-        json!({"name":"get_quota", "description":"Read stored quota metrics and account reset credits from the local service. Does not contact providers or start models. Narrow account or model scope if the result is too large.",
+        json!({"name":"get_quota", "description":"Read stored per-account quota windows, reset times, risk reasons, reset credits, and Codex paid balances. Does not contact providers or start models. Narrow account or model scope if the result is too large.",
         "inputSchema":{"type":"object","properties":{"accounts":{"type":"array","items":{"type":"string"},"maxItems":256},"model":{"type":["string","null"],"maxLength":256}},"additionalProperties":false},
         "annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}}),
-        json!({"name":"get_capacity", "description":"Rank configured providers and their models by stored quota capacity (highest first), applying Quota's provider and account multipliers. Shows each model's status (available, limited, unknown, priority_overflow, exhausted), remaining percentage, limiting window, reset and evidence freshness. Account-free: no account or pool identities. Read-only; does not contact providers or start models.",
+        json!({"name":"get_capacity", "description":"Rank configured providers by stored window and credit capacity, applying provider and account multipliers. Shows model statuses and reasons, remaining percentages and resets for each window, stale evidence, and ranking credits without account or pool identities. Read-only; does not contact providers or start models.",
         "inputSchema":{"type":"object","properties":{"model":{"type":["string","null"],"maxLength":256}},"additionalProperties":false},
         "annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}}),
         // xtask:definitions
@@ -31,14 +36,22 @@ pub fn templates() -> Vec<(&'static str, &'static str)> {
             "quota",
             concat!(
                 "Quota at {{ evaluated_at }} | coverage: {{ coverage }}\n",
-                "{% for row in rows %}{{ row.account }} | {{ row.provider }} | {{ row.model }} | {{ row.state }} | remaining: {{ row.remaining }} | burn/hour: {{ row.burn }} | reset: {{ row.reset }} | risk: {{ row.risk }}\n{% else %}No configured models in scope.\n{% endfor %}",
-                "{% for row in reset_credits %}{{ row.account }} | reset credits: {% if row.known %}known{% else %}unknown{% endif %} | available count: {{ row.available_count }} | observed: {{ row.observed_at }}\n",
+                "{% for row in rows %}{{ row.account }} | {{ row.provider }} | {{ row.model }} | {{ row.details.status }}{% if row.details.reason %}: {{ row.details.reason }}{% endif %}{% if row.details.stale %} | {{ row.details.stale }}{% endif +%}\n",
+                "{% for window in row.details.windows %}  {{ window.label }} | {{ window.remaining }}{% if window.burn %} | burn {{ window.burn }}{% endif %} | reset {{ window.reset }}{% if window.stale %} | {{ window.stale }}{% endif +%}\n{% endfor %}",
+                "{% else %}No configured models in scope.\n{% endfor %}",
+                "{% for row in reset_credits %}{{ row.account }} | reset credits: {% if row.known %}known{% else %}unknown{% endif %} | available count: {{ row.available_count }}{% if row.paid %} | paid credits: {{ row.paid }}{% endif +%}\n",
                 "{% for credit in row.credits %}  {{ credit.id }} | {{ credit.provider_kind }} | {{ credit.label }} | {{ credit.scope }} | resets left: {{ credit.resets_left }} | usable now: {{ credit.usable_now }} | granted: {{ credit.granted_at }} | expires: {{ credit.expires_at }}\n{% endfor %}{% endfor %}",
             ),
         ),
         (
             "capacity",
-            "Capacity order at {{ evaluated_at }} | coverage: {{ coverage }}\n{% for provider in providers %}{{ provider.rank }}. {{ provider.provider }} | status: {{ provider.status }} | score: {{ provider.score }} | multiplier: {{ provider.multiplier }}\n{% for model in provider.models %}   {{ model.model }} | {{ model.status }} | remaining: {{ model.remaining }}{% if model.window %} ({{ model.window }}){% endif %} | reset: {{ model.reset }} | risk: {{ model.risk }} | evidence: {{ model.evidence }} | observed: {{ model.observed }}\n{% endfor %}{% else %}No configured providers in scope.\n{% endfor %}",
+            concat!(
+                "Capacity order at {{ evaluated_at }} | coverage: {{ coverage }}\n",
+                "{% for provider in providers %}{{ provider.rank }}. {{ provider.provider }} | status: {{ provider.status }} | score: {{ provider.score }}\n",
+                "{% for model in provider.models %}   {{ model.model }} | {{ model.details.status }}{% if model.details.reason %}: {{ model.details.reason }}{% endif %}{% if model.details.stale %} | {{ model.details.stale }}{% endif %}{% for credit in model.credits %} | {{ credit }}{% endfor +%}\n",
+                "{% for window in model.details.windows %}     {{ window.label }} | {{ window.remaining }}{% if window.burn %} | burn {{ window.burn }}{% endif %} | reset {{ window.reset }}{% if window.stale %} | {{ window.stale }}{% endif +%}\n{% endfor %}",
+                "{% endfor %}{% else %}No configured providers in scope.\n{% endfor %}",
+            ),
         ),
         // xtask:templates
     ]
@@ -122,6 +135,9 @@ struct Account {
     models: Vec<Model>,
     #[serde(default)]
     reset_credits: ResetCreditSnapshot,
+    credit_balance: Option<CreditBalance>,
+    #[serde(default)]
+    windows: Vec<SnapshotWindow>,
 }
 #[derive(Deserialize)]
 struct Model {
@@ -133,12 +149,21 @@ struct Model {
     burn_percent_per_hour: Option<f64>,
     reset_at: Option<f64>,
     risk: String,
+    limiting_window: Option<LimitingWindow>,
+    newest_observed_at: Option<f64>,
+    #[serde(default)]
+    evidence: String,
+}
+
+#[derive(Deserialize)]
+struct LimitingWindow {
+    window: String,
 }
 
 /// Bounded and display-safe data handed to the embedded quota template.
 #[derive(Serialize)]
 struct QuotaView {
-    evaluated_at: f64,
+    evaluated_at: String,
     coverage: String,
     rows: Vec<QuotaRow>,
     reset_credits: Vec<ResetCreditsView>,
@@ -150,7 +175,7 @@ struct ResetCreditsView {
     account: String,
     known: bool,
     available_count: String,
-    observed_at: String,
+    paid: Option<String>,
     credits: Vec<ResetCreditView>,
 }
 /// Display-safe facts for one provider credit.
@@ -170,11 +195,92 @@ struct QuotaRow {
     account: String,
     provider: String,
     model: String,
-    state: String,
+    details: ModelDetails,
+}
+
+/// Status, explanation and display windows shared by both text views.
+#[derive(Serialize)]
+struct ModelDetails {
+    status: String,
+    reason: Option<String>,
+    stale: Option<String>,
+    windows: Vec<WindowRow>,
+}
+
+#[derive(Serialize)]
+struct WindowRow {
+    label: String,
     remaining: String,
-    burn: String,
+    burn: Option<String>,
     reset: String,
-    risk: String,
+    stale: Option<String>,
+}
+
+/// Names common windows and preserves the exact recoverable text of custom names.
+fn window_label(window: &str) -> Result<String, &'static str> {
+    let label = display::window_label(window);
+    if matches!(label, "5h" | "7d" | "monthly") {
+        Ok(label.to_owned())
+    } else {
+        quoted(label)
+    }
+}
+
+/// Displays every governing counter and labels historical observations as stale.
+fn window_rows(
+    windows: impl IntoIterator<Item = WindowView>,
+    now: f64,
+) -> Result<Vec<WindowRow>, &'static str> {
+    windows
+        .into_iter()
+        .map(|window| {
+            let label = window_label(&window.window)?;
+            let label = if window.model_specific {
+                format!("{label} (model-specific)")
+            } else {
+                label
+            };
+            Ok(WindowRow {
+                label,
+                remaining: window
+                    .last_remaining_percent
+                    .filter(|_| !window.known)
+                    .map_or_else(
+                        || display::percent(window.remaining_percent),
+                        |last| format!("last {last:.0}%"),
+                    ),
+                burn: window.burn_percent_per_hour.map(display::burn),
+                reset: display::utc(window.reset_at, Some(now)),
+                stale: window
+                    .observed_at
+                    .filter(|_| !window.known)
+                    .map(|at| display::stale(Some(at), now)),
+            })
+        })
+        .collect()
+}
+
+/// Adds the limiting counter for an older service, or for a latch without samples.
+fn add_limiting_window(
+    windows: &mut Vec<WindowRow>,
+    limiting: Option<&str>,
+    remaining: Option<f64>,
+    burn: Option<f64>,
+    reset: Option<f64>,
+    now: f64,
+) -> Result<(), &'static str> {
+    if windows.is_empty()
+        && let Some(limiting) = limiting
+    {
+        windows.push(WindowRow {
+            label: window_label(limiting)?,
+            remaining: display::percent(remaining),
+            burn: burn.map(display::burn),
+            reset: display::utc(reset, Some(now)),
+            stale: None,
+        });
+    }
+    Ok(())
 }
 
 /// Quotes labels and escapes directional controls without changing their recoverable text.
@@ -185,7 +291,7 @@ fn quoted(value: &str) -> Result<String, &'static str> {
     let encoded = serde_json::to_string(value).map_err(|_| "invalid_service_response")?;
     let mut output = String::new();
     for character in encoded.chars() {
-        if matches!(character, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        if matches!(character, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
         {
             output.push_str(&format!("\\u{:04x}", character as u32));
         } else {
@@ -231,8 +337,8 @@ fn quota_view(value: Value, filter: Option<&str>) -> Result<QuotaView, &'static 
                     scope: quoted(&credit.scope)?,
                     resets_left: display_fact(credit.resets_left),
                     usable_now: display_fact(credit.usable_now),
-                    granted_at: display_fact(credit.granted_at),
-                    expires_at: display_fact(credit.expires_at),
+                    granted_at: display::utc(credit.granted_at, None),
+                    expires_at: display::utc(credit.expires_at, None),
                 })
             })
             .collect::<Result<Vec<_>, &'static str>>()?;
@@ -240,7 +346,7 @@ fn quota_view(value: Value, filter: Option<&str>) -> Result<QuotaView, &'static 
             account: account_name.clone(),
             known: credits.inventory.known,
             available_count: display_fact(credits.inventory.available_count),
-            observed_at: display_fact(credits.observed_at),
+            paid: account.credit_balance.as_ref().map(display::paid),
             credits: rows_of_credits,
         });
         for model in account.models {
@@ -252,21 +358,45 @@ fn quota_view(value: Value, filter: Option<&str>) -> Result<QuotaView, &'static 
             {
                 return Err("invalid_service_response");
             }
+            let at = snapshot.evaluated_at;
+            let status = match (model.state.as_str(), model.risk.as_str()) {
+                ("known", "high") => "limited",
+                ("known", _) => "available",
+                (status, _) => status,
+            };
+            let limiting = model
+                .limiting_window
+                .as_ref()
+                .map(|window| window.window.as_str());
+            let label = limiting.map(window_label).transpose()?;
+            let mut windows = window_rows(
+                capacity::windows(&account.windows, &model.native_model, at, at),
+                at,
+            )?;
+            add_limiting_window(
+                &mut windows,
+                limiting,
+                model.remaining_percent,
+                model.burn_percent_per_hour,
+                model.reset_at,
+                at,
+            )?;
             rows.push(QuotaRow {
                 account: account_name.clone(),
                 provider: quoted(&model.provider)?,
                 model: quoted(&model.model)?,
-                state: model.state,
-                remaining: model
-                    .remaining_percent
-                    .map_or_else(|| "unknown".into(), |value| format!("{value}%")),
-                burn: model
-                    .burn_percent_per_hour
-                    .map_or_else(|| "unknown".into(), |value| format!("{value}%")),
-                reset: model
-                    .reset_at
-                    .map_or_else(|| "unknown".into(), |value| value.to_string()),
-                risk: model.risk,
+                details: ModelDetails {
+                    status: status.to_owned(),
+                    reason: display::reason(
+                        status,
+                        label.as_deref(),
+                        model.remaining_percent,
+                        model.burn_percent_per_hour,
+                    ),
+                    stale: (model.evidence == "stale")
+                        .then(|| display::stale(model.newest_observed_at, at)),
+                    windows,
+                },
             });
             if rows.len() > 20 {
                 return Err("response_too_large");
@@ -274,7 +404,7 @@ fn quota_view(value: Value, filter: Option<&str>) -> Result<QuotaView, &'static 
         }
     }
     Ok(QuotaView {
-        evaluated_at: snapshot.evaluated_at,
+        evaluated_at: display::utc(Some(snapshot.evaluated_at), None),
         coverage: snapshot.coverage.state,
         rows,
         reset_credits,
@@ -305,6 +435,9 @@ fn quota_error(code: &str) -> CallToolResult {
             "ERROR unsupported_method: the quota service is older than this client; capacity is unknown.\n"
         }
         "unavailable" => "ERROR unavailable: quota service is unavailable; quota is unknown.\n",
+        "presentation_failed" => {
+            "ERROR presentation_failed: the local read succeeded but the text could not be rendered. Narrow the account or model scope or use CLI JSON.\n"
+        }
         _ => "ERROR quota_read_failed: no quota data was returned.\n",
     };
     CallToolResult::error(vec![ContentBlock::text(text)])
@@ -376,7 +509,6 @@ struct CapacityCoverage {
 #[derive(Deserialize)]
 struct CapacityProvider {
     provider: String,
-    priority_multiplier: f64,
     score: Option<f64>,
     status: String,
     models: Vec<CapacityModel>,
@@ -391,12 +523,19 @@ struct CapacityModel {
     remaining_percent: Option<f64>,
     reset_at: Option<f64>,
     risk: String,
+    burn_percent_per_hour: Option<f64>,
+    #[serde(default)]
+    windows: Vec<WindowView>,
+    #[serde(default)]
+    additional_windows: Vec<WindowView>,
+    #[serde(default)]
+    ranking_credits: RankingCredits,
 }
 
 /// Bounded display-safe capacity page.
 #[derive(Serialize)]
 struct CapacityPage {
-    evaluated_at: f64,
+    evaluated_at: String,
     /// Coverage state with an `(incomplete)` marker when any model is unknown.
     coverage: String,
     providers: Vec<CapacityProviderRow>,
@@ -407,28 +546,17 @@ struct CapacityProviderRow {
     provider: String,
     status: String,
     score: String,
-    multiplier: f64,
     models: Vec<CapacityModelRow>,
 }
 #[derive(Serialize)]
 struct CapacityModelRow {
     model: String,
-    status: String,
-    remaining: String,
-    window: Option<String>,
-    reset: String,
-    risk: String,
-    evidence: String,
-    observed: String,
+    details: ModelDetails,
+    credits: Vec<String>,
 }
 
 /// Maximum rendered model rows; a larger catalog must be narrowed by model.
 const MAX_CAPACITY_ROWS: usize = 60;
-
-/// Formats an optional number, keeping absent values explicitly unknown.
-fn unknown_or(value: Option<f64>, suffix: &str) -> String {
-    value.map_or_else(|| "unknown".into(), |value| format!("{value}{suffix}"))
-}
 
 /// Validates and projects a capacity result without silently dropping rows.
 fn capacity_view(value: Value) -> Result<CapacityPage, &'static str> {
@@ -468,15 +596,36 @@ fn capacity_view(value: Value) -> Result<CapacityPage, &'static str> {
             if rows > MAX_CAPACITY_ROWS {
                 return Err("response_too_large");
             }
+            let at = capacity.evaluated_at;
+            let limiting = model.limiting_window.as_deref();
+            let label = limiting.map(window_label).transpose()?;
+            let mut windows = window_rows(
+                model.windows.into_iter().chain(model.additional_windows),
+                at,
+            )?;
+            add_limiting_window(
+                &mut windows,
+                limiting,
+                model.remaining_percent,
+                model.burn_percent_per_hour,
+                model.reset_at,
+                at,
+            )?;
             models.push(CapacityModelRow {
                 model: quoted(&model.model)?,
-                status: model.status,
-                remaining: unknown_or(model.remaining_percent, "%"),
-                window: model.limiting_window.as_deref().map(quoted).transpose()?,
-                reset: unknown_or(model.reset_at, ""),
-                risk: model.risk,
-                evidence: model.evidence,
-                observed: unknown_or(model.newest_observed_at, ""),
+                details: ModelDetails {
+                    reason: display::reason(
+                        &model.status,
+                        label.as_deref(),
+                        model.remaining_percent,
+                        model.burn_percent_per_hour,
+                    ),
+                    stale: (model.evidence == "stale")
+                        .then(|| display::stale(model.newest_observed_at, at)),
+                    status: model.status,
+                    windows,
+                },
+                credits: display::credit_badges(&model.ranking_credits),
             });
         }
         providers.push(CapacityProviderRow {
@@ -484,7 +633,6 @@ fn capacity_view(value: Value) -> Result<CapacityPage, &'static str> {
             provider: quoted(&provider.provider)?,
             status: provider.status,
             score: provider_score(provider.score),
-            multiplier: provider.priority_multiplier,
             models,
         });
     }
@@ -494,7 +642,7 @@ fn capacity_view(value: Value) -> Result<CapacityPage, &'static str> {
         capacity.coverage.state
     };
     Ok(CapacityPage {
-        evaluated_at: capacity.evaluated_at,
+        evaluated_at: display::utc(Some(capacity.evaluated_at), None),
         coverage,
         providers,
     })
@@ -502,7 +650,7 @@ fn capacity_view(value: Value) -> Result<CapacityPage, &'static str> {
 
 /// Shows an absent provider score as `none` (no known capacity), not zero.
 fn provider_score(score: Option<f64>) -> String {
-    score.map_or_else(|| "none".into(), |score| format!("{score:.4}"))
+    score.map_or_else(|| "none".into(), |score| format!("{score:.2}"))
 }
 
 /// Reads the account-free capacity order once and renders a validated bounded page.
@@ -564,7 +712,7 @@ mod tests {
         let view = quota_view(snapshot.clone(), Some("a\u{202e}b")).unwrap();
         assert_eq!(view.rows.len(), 1);
         assert!(view.rows[0].model.contains("\\u202e"));
-        assert_eq!(view.rows[0].remaining, "unknown");
+        assert_eq!(view.rows[0].details.status, "unknown");
         assert_eq!(view.coverage, "partial");
         let templates = Templates::new(&templates()).unwrap();
         assert!(templates.render("quota", &view).is_ok());
@@ -604,11 +752,81 @@ mod tests {
         let view = quota_view(snapshot, None).unwrap();
         let templates = Templates::new(&templates()).unwrap();
         let text = templates.render("quota", &view).unwrap();
-        assert!(
-            text.contains(r#""acct" | reset credits: known | available count: 0 | observed: 999"#)
-        );
-        assert!(text.contains(r#""fixture-credit" | "GRANT" | "Fixture credit" | "all" | resets left: 2 | usable now: false | granted: unknown | expires: 4000"#));
+        assert!(text.contains(r#""acct" | reset credits: known | available count: 0"#));
+        assert!(text.contains(r#""fixture-credit" | "GRANT" | "Fixture credit" | "all" | resets left: 2 | usable now: false | granted: unknown | expires: 01.01 01:06 UTC"#));
+        assert!(!text.contains("observed:"));
         assert_eq!(text.matches("fixture-credit").count(), 1);
+    }
+
+    /// Both tools show every window, precise UTC resets and readable risk and credit evidence.
+    #[test]
+    fn quota_and_capacity_render_readable_multi_window_snapshots() {
+        let at = 1795798740.0;
+        let fast = json!({"window":"five_hour","lane":"codex","source":"fixture","known":true,
+            "models":["gpt"],"observed_at":at,"valid_until":at+3600.0,
+            "remaining_percent":64.4,"burn_percent_per_hour":6.545274455184143,"reset_at":1795803060.0,
+            "last_reset_at":1795803060.0,"last_remaining_percent":64.4,
+            "forecast":{"known":true,"remaining_percent":64.4,"burn_percent_per_hour":6.545274455184143}});
+        let slow = json!({"window":"seven_day","lane":"codex","source":"fixture","known":true,
+            "models":["gpt"],"observed_at":at,"valid_until":at+3600.0,
+            "remaining_percent":63.0,"burn_percent_per_hour":20.0,"reset_at":1796331540.0,
+            "last_reset_at":1796331540.0,"last_remaining_percent":63.0,
+            "forecast":{"known":true,"remaining_percent":63.0,"burn_percent_per_hour":20.0}});
+        let credit = json!({"has_credits":true,"unlimited":false,"balance":"42.50"});
+        let snapshot = json!({"schema_version":2,"evaluated_at":at,"coverage":{"state":"complete"},
+        "accounts":[{"account":"personal","credit_balance":credit,"windows":[fast, slow],"models":[
+            {"provider":"codex","model":"gpt","native_model":"gpt","state":"known","risk":"high",
+             "limiting_window":{"window":"seven_day"},"remaining_percent":63.0,"burn_percent_per_hour":20.0,
+             "reset_at":1796331540.0}
+        ]}]});
+        let capacity = json!({"schema_version":1,"evaluated_at":at,"coverage":{"state":"complete","incomplete":false},
+        "providers":[{"provider":"codex","status":"limited","score":0.5341,"models":[
+            {"model":"gpt","status":"limited","risk":"high","evidence":"fresh",
+             "limiting_window":"seven_day","remaining_percent":63.0,"burn_percent_per_hour":20.0,
+             "reset_at":1796331540.0,"windows":[fast, slow],"ranking_credits":{"reset_uses":1,"paid":credit}}
+        ]}]});
+        let renderer = Templates::new(&templates()).unwrap();
+        let quota = renderer
+            .render("quota", &quota_view(snapshot, None).unwrap())
+            .unwrap();
+        assert_eq!(
+            quota,
+            concat!(
+                "Quota at 27.11 16:59 UTC | coverage: complete\n",
+                "\"personal\" | \"codex\" | \"gpt\" | limited: 7d window 63% left, burn 20.0%/h → runs out before reset\n",
+                "  5h | 64% | burn 6.5%/h | reset 27.11 18:11 UTC (in 1h)\n",
+                "  7d | 63% | burn 20.0%/h | reset 03.12 20:59 UTC (in 6d 4h)\n",
+                "\"personal\" | reset credits: unknown | available count: unknown | paid credits: $42.50\n",
+            )
+        );
+        let order = renderer
+            .render("capacity", &capacity_view(capacity.clone()).unwrap())
+            .unwrap();
+        assert_eq!(
+            order,
+            concat!(
+                "Capacity order at 27.11 16:59 UTC | coverage: complete\n",
+                "1. \"codex\" | status: limited | score: 0.53\n",
+                "   \"gpt\" | limited: 7d window 63% left, burn 20.0%/h → runs out before reset | +reset credit | +credits $42.50\n",
+                "     5h | 64% | burn 6.5%/h | reset 27.11 18:11 UTC (in 1h)\n",
+                "     7d | 63% | burn 20.0%/h | reset 03.12 20:59 UTC (in 6d 4h)\n",
+            )
+        );
+        let mut old = capacity;
+        let model = &mut old["providers"][0]["models"][0];
+        model["status"] = json!("unknown");
+        model["evidence"] = json!("stale");
+        model["newest_observed_at"] = json!(at - 7200.0);
+        let window = &mut model["windows"][0];
+        window["known"] = json!(false);
+        window["remaining_percent"] = Value::Null;
+        window["burn_percent_per_hour"] = Value::Null;
+        window["observed_at"] = json!(at - 7200.0);
+        let stale = renderer
+            .render("capacity", &capacity_view(old).unwrap())
+            .unwrap();
+        assert!(stale.contains("\"gpt\" | unknown | stale: 2h old"));
+        assert!(stale.contains("5h | last 64% | reset 27.11 18:11 UTC (in 1h) | stale: 2h old"));
     }
 
     /// Capacity pages escape labels, keep unknown explicit and refuse invalid or oversized results.
@@ -625,7 +843,7 @@ mod tests {
         let page = capacity_view(capacity.clone()).unwrap();
         assert!(page.providers[0].provider.contains("\\u202e"));
         assert_eq!(page.providers[0].score, "none");
-        assert_eq!(page.providers[0].models[0].remaining, "unknown");
+        assert_eq!(page.providers[0].models[0].details.status, "unknown");
         let templates = Templates::new(&templates()).unwrap();
         let text = templates.render("capacity", &page).unwrap();
         assert!(

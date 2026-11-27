@@ -6,9 +6,14 @@
 //! cooldowns and active-attempt accounting are Run state and are not applied
 //! here. The result never contains account identities, pools or credentials.
 
-use crate::config::{ProviderRanking, QuotaConfig};
+use crate::{
+    config::{HarnessId, ProviderRanking, QuotaConfig},
+    display,
+    quota::{CreditBalance, ResetCreditSnapshot},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -21,7 +26,7 @@ pub(crate) const HOOK_HARD_LIMIT_CHARS: usize = 2500;
 /// Default hook budget: agent-run's priority slot (2500 - 600 active - 1 separator).
 pub(crate) const HOOK_DEFAULT_CHARS: usize = 1899;
 /// Header of the compact hook block; wording follows agent-run's former block.
-const HOOK_HEADER: &str = "Provider capacity order (highest first; read-only). Pick provider, model, effort and profile yourself; agent-quota get_capacity has windows and resets. unknown = quota cannot be determined from available data, not a health claim; limited = known capacity at high quota risk.";
+const HOOK_HEADER: &str = "Quota update · provider capacity order (highest first, resets in UTC).";
 /// Omission instruction appended when complete provider lines do not fit.
 const HOOK_OMITTED: &str = "More routes omitted; use agent-quota get_capacity if needed";
 
@@ -46,7 +51,10 @@ struct Coverage {
 struct Account {
     account: String,
     models: Vec<Model>,
-    windows: Vec<Window>,
+    windows: Vec<SnapshotWindow>,
+    #[serde(default)]
+    reset_credits: ResetCreditSnapshot,
+    credit_balance: Option<CreditBalance>,
 }
 /// One account's quota-only model standing as computed by the snapshot.
 #[derive(Deserialize)]
@@ -59,6 +67,7 @@ struct Model {
     quota_score: Option<f64>,
     limiting_window: Option<Value>,
     remaining_percent: Option<f64>,
+    burn_percent_per_hour: Option<f64>,
     reset_at: Option<f64>,
     risk: String,
     newest_observed_at: Option<f64>,
@@ -74,7 +83,7 @@ enum Validity {
 }
 /// One physical window with its exact model membership.
 #[derive(Deserialize)]
-struct Window {
+pub(crate) struct SnapshotWindow {
     lane: String,
     source: String,
     window: String,
@@ -82,6 +91,7 @@ struct Window {
     observed_at: Option<f64>,
     valid_until: Option<f64>,
     last_reset_at: Option<f64>,
+    last_remaining_percent: Option<f64>,
     forecast: WindowForecast,
 }
 /// The forecast fields needed for an account-free window row.
@@ -89,12 +99,17 @@ struct Window {
 struct WindowForecast {
     known: bool,
     remaining_percent: Option<f64>,
+    burn_percent_per_hour: Option<f64>,
 }
 
 /// One account's standing on one model lane, as in agent-run's `LaneVerdict`.
 enum Verdict<'a> {
     /// Usable capacity with `quota_score * account multiplier`.
-    Known { priority: f64, model: &'a Model },
+    Known {
+        priority: f64,
+        raw: f64,
+        model: &'a Model,
+    },
     /// No current evidence.
     Unknown,
     /// Current evidence whose weighted priority exceeds the finite range.
@@ -127,7 +142,7 @@ struct CoverageView {
 struct ProviderView {
     provider: String,
     priority_multiplier: f64,
-    /// Best available model priority times the provider multiplier; null without known capacity.
+    /// Best credit-adjusted model priority times the provider multiplier.
     score: Option<f64>,
     /// Best model status of this provider.
     status: &'static str,
@@ -155,17 +170,98 @@ struct ModelView {
     /// Exclusive state-class boundary of the representative account, when bounded.
     valid_until: Option<f64>,
     windows: Vec<WindowView>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    additional_windows: Vec<WindowView>,
+    burn_percent_per_hour: Option<f64>,
+    /// Credit-adjusted model priority, including an exhausted plan with usable credits.
+    ranking_priority: Option<f64>,
+    /// Credits of the account that supplied the adjusted priority.
+    ranking_credits: RankingCredits,
+    /// Total applicable reset uses and count of paid-credit bindings for change detection.
+    credit_availability: (u64, usize),
 }
 /// One governing window of the representative account, without pool or account identity.
-#[derive(Serialize)]
-struct WindowView {
-    window: String,
-    source: String,
-    known: bool,
-    remaining_percent: Option<f64>,
-    reset_at: Option<f64>,
-    observed_at: Option<f64>,
+#[derive(Deserialize, Serialize, PartialEq)]
+pub(crate) struct WindowView {
+    pub window: String,
+    pub source: String,
+    pub known: bool,
+    pub remaining_percent: Option<f64>,
+    pub reset_at: Option<f64>,
+    pub observed_at: Option<f64>,
     valid_until: Option<f64>,
+    pub last_remaining_percent: Option<f64>,
+    pub burn_percent_per_hour: Option<f64>,
+    #[serde(default)]
+    pub model_specific: bool,
+}
+
+/// Credit capacity from one winning account, without credit IDs or account metadata.
+#[derive(Default, Deserialize, Serialize)]
+pub(crate) struct RankingCredits {
+    pub reset_uses: u32,
+    pub paid: Option<CreditBalance>,
+}
+
+impl RankingCredits {
+    /// Historical reset multiplier, plus bounded capacity for a reset or paid fallback.
+    fn adjusted(&self, raw: f64, ranking: &ProviderRanking) -> f64 {
+        let uses = f64::from(self.reset_uses);
+        let base = if self.reset_uses > 0 {
+            raw.max(ranking.reset_credit_floor)
+        } else {
+            raw
+        };
+        base * (1.0 + uses / (uses + 1.0))
+            + self
+                .paid
+                .as_ref()
+                .map_or(0.0, |_| ranking.paid_credit_bonus)
+    }
+}
+
+/// Count currently usable reset uses that cover this model's limiting window.
+fn ranking_credits(account: &Account, model: &Model, codex: bool, at: f64) -> RankingCredits {
+    let snapshot = &account.reset_credits;
+    let window = model
+        .limiting_window
+        .as_ref()
+        .and_then(|key| key["window"].as_str());
+    let reset_uses =
+        if snapshot.inventory.known && snapshot.observed_at.is_some_and(|time| time <= at) {
+            if snapshot.inventory.credits.is_empty() {
+                snapshot.inventory.available_count.unwrap_or(0)
+            } else {
+                snapshot
+                    .inventory
+                    .credits
+                    .iter()
+                    .filter(|credit| {
+                        credit.usable_now == Some(true)
+                            && credit.granted_at.is_none_or(|time| time <= at)
+                            && credit.expires_at.is_none_or(|time| at < time)
+                            && match credit.scope.as_str() {
+                                "all" => true,
+                                scope if Some(scope) == window => true,
+                                scope => scope.strip_prefix("model:").is_some_and(|name| {
+                                    name == model.model || name == model.native_model
+                                }),
+                            }
+                    })
+                    .map(|credit| credit.resets_left.unwrap_or(1))
+                    .fold(0u32, u32::saturating_add)
+            }
+        } else {
+            0
+        };
+    RankingCredits {
+        reset_uses,
+        paid: account
+            .credit_balance
+            .as_ref()
+            .filter(|credit| codex && credit.available())
+            .cloned(),
+    }
 }
 
 /// Agent Run's status order for score ties. Both known display statuses share a rank.
@@ -215,16 +311,24 @@ fn verdict(
         .ok_or("invalid_service_response")?;
     let priority = raw * factor;
     Ok(if priority.is_finite() {
-        Verdict::Known { priority, model }
+        Verdict::Known {
+            priority,
+            raw,
+            model,
+        }
     } else {
         Verdict::Overflow
     })
 }
 
 /// Account-free window details of the representative account's model lane.
-fn windows(account: &Account, native: &str, at: f64, evaluated_at: f64) -> Vec<WindowView> {
-    let mut rows: Vec<WindowView> = account
-        .windows
+pub(crate) fn windows(
+    windows: &[SnapshotWindow],
+    native: &str,
+    at: f64,
+    evaluated_at: f64,
+) -> Vec<WindowView> {
+    let mut rows: Vec<WindowView> = windows
         .iter()
         .filter(|window| governs(&window.models, &window.lane, native))
         .map(|window| {
@@ -246,11 +350,13 @@ fn windows(account: &Account, native: &str, at: f64, evaluated_at: f64) -> Vec<W
                 reset_at: window.last_reset_at,
                 observed_at: window.observed_at,
                 valid_until: window.valid_until,
+                last_remaining_percent: window.last_remaining_percent,
+                burn_percent_per_hour: window.forecast.burn_percent_per_hour.filter(|_| known),
+                model_specific: window.lane.starts_with("model:"),
             }
         })
         .collect();
     rows.sort_by(|a, b| (&a.window, &a.source).cmp(&(&b.window, &b.source)));
-    rows.truncate(MAX_MODEL_WINDOWS);
     rows
 }
 
@@ -321,7 +427,7 @@ pub(crate) fn rank(
         for model_id in offering {
             // Effective account weight: the maximum of its eligible bindings, never a sum.
             // Ordered providers use weights as a fallback sequence, so ranking is neutral.
-            let mut eligible: BTreeMap<(&str, &str), f64> = BTreeMap::new();
+            let mut eligible: BTreeMap<(&str, &str), (f64, bool)> = BTreeMap::new();
             for source in &sources {
                 if let Some(model) = source.models.iter().find(|model| model.id == model_id) {
                     let factor = if ranking.ordered_accounts {
@@ -329,10 +435,14 @@ pub(crate) fn rank(
                     } else {
                         source.priority_multiplier
                     };
+                    let codex = source.harness.id == HarnessId::Codex;
                     eligible
                         .entry((source.account.as_str(), model.lane()))
-                        .and_modify(|value| *value = value.max(factor))
-                        .or_insert(factor);
+                        .and_modify(|(value, supports_paid)| {
+                            *value = value.max(factor);
+                            *supports_paid |= codex;
+                        })
+                        .or_insert((factor, codex));
                 }
             }
             let mut known: Vec<(f64, &Model, &Account)> = Vec::new();
@@ -341,7 +451,11 @@ pub(crate) fn rank(
             let mut overflow = false;
             let mut newest: Option<f64> = None;
             let mut native_model: Option<&str> = None;
-            for ((account_id, native), factor) in &eligible {
+            let mut adjusted = None;
+            let mut ranking_credit = RankingCredits::default();
+            let mut credit_availability = (0u64, 0usize);
+            let mut fallback: Option<(&Model, &Account)> = None;
+            for ((account_id, native), (factor, codex)) in &eligible {
                 let Some(account) = accounts.get(account_id) else {
                     continue;
                 };
@@ -353,6 +467,11 @@ pub(crate) fn rank(
                     continue;
                 };
                 native_model.get_or_insert(native);
+                if fallback.is_none_or(|(previous, _)| {
+                    view.newest_observed_at > previous.newest_observed_at
+                }) {
+                    fallback = Some((view, account));
+                }
                 if at >= snapshot.evaluated_at
                     && let Some(observed) = view
                         .newest_observed_at
@@ -360,11 +479,41 @@ pub(crate) fn rank(
                 {
                     newest = Some(newest.map_or(observed, |current: f64| current.max(observed)));
                 }
-                match verdict(view, *factor, at, snapshot.evaluated_at)? {
-                    Verdict::Known { priority, model } => known.push((priority, model, account)),
-                    Verdict::Exhausted { model } => exhausted.push((model, account)),
-                    Verdict::Unknown => unknown = true,
-                    Verdict::Overflow => overflow = true,
+                let credits = ranking_credits(account, view, *codex, at);
+                credit_availability.0 += u64::from(credits.reset_uses);
+                credit_availability.1 += usize::from(credits.paid.is_some());
+                let raw = match verdict(view, *factor, at, snapshot.evaluated_at)? {
+                    Verdict::Known {
+                        priority,
+                        raw,
+                        model,
+                    } => {
+                        known.push((priority, model, account));
+                        Some(raw)
+                    }
+                    Verdict::Exhausted { model } => {
+                        exhausted.push((model, account));
+                        (credits.reset_uses > 0 || credits.paid.is_some()).then_some(0.0)
+                    }
+                    Verdict::Unknown => {
+                        unknown = true;
+                        None
+                    }
+                    Verdict::Overflow => {
+                        overflow = true;
+                        None
+                    }
+                };
+                if let Some(raw) = raw {
+                    let adjusted_raw = credits.adjusted(raw, ranking);
+                    if raw == 0.0 && adjusted_raw == 0.0 && view.state == "exhausted" {
+                        continue;
+                    }
+                    let priority = (adjusted_raw * factor).min(f64::MAX);
+                    if adjusted.is_none_or(|best| priority > best) {
+                        adjusted = Some(priority);
+                        ranking_credit = credits;
+                    }
                 }
             }
             let Some(native_model) = native_model else {
@@ -400,7 +549,7 @@ pub(crate) fn rank(
             };
             incomplete |= unknown || overflow;
             let best_priority = known.first().map(|(priority, _, _)| *priority);
-            if let Some(priority) = best_priority {
+            if let Some(priority) = adjusted {
                 best = Some(best.map_or(priority, |current: f64| current.max(priority)));
             }
             let representative = match status {
@@ -425,6 +574,24 @@ pub(crate) fn rank(
                 )
             } else {
                 None
+            };
+            let mut detail_windows =
+                representative
+                    .or(fallback)
+                    .map_or_else(Vec::new, |(model, account)| {
+                        windows(
+                            &account.windows,
+                            &model.native_model,
+                            at,
+                            snapshot.evaluated_at,
+                        )
+                    });
+            let additional_windows = if representative.is_none() {
+                std::mem::take(&mut detail_windows)
+            } else if detail_windows.len() > MAX_MODEL_WINDOWS {
+                detail_windows.split_off(MAX_MODEL_WINDOWS)
+            } else {
+                Vec::new()
             };
             models.push(ModelView {
                 model: model_id.to_owned(),
@@ -451,9 +618,13 @@ pub(crate) fn rank(
                     Validity::Until { at } => Some(at),
                     _ => None,
                 }),
-                windows: representative.map_or_else(Vec::new, |(model, account)| {
-                    windows(account, &model.native_model, at, snapshot.evaluated_at)
-                }),
+                windows: detail_windows,
+                additional_windows,
+                burn_percent_per_hour: representative
+                    .and_then(|(model, _)| model.burn_percent_per_hour),
+                ranking_priority: adjusted,
+                ranking_credits: ranking_credit,
+                credit_availability,
             });
         }
         if models.is_empty() {
@@ -518,6 +689,7 @@ pub(crate) fn json_ascii(value: &str) -> String {
 struct HookCapacity {
     schema_version: u8,
     coverage: Coverage,
+    evaluated_at: f64,
     providers: Vec<HookProvider>,
 }
 /// One provider line of the hook block.
@@ -531,17 +703,190 @@ struct HookProvider {
 struct HookModel {
     model: String,
     status: String,
+    limiting_window: Option<String>,
+    remaining_percent: Option<f64>,
+    reset_at: Option<f64>,
+    burn_percent_per_hour: Option<f64>,
+    newest_observed_at: Option<f64>,
+    #[serde(default)]
+    evidence: String,
+    #[serde(default)]
+    windows: Vec<WindowView>,
+    #[serde(default)]
+    additional_windows: Vec<WindowView>,
+    #[serde(default)]
+    ranking_credits: RankingCredits,
+    #[serde(default)]
+    credit_availability: (u64, usize),
+}
+
+impl HookModel {
+    fn windows(&self) -> impl Iterator<Item = &WindowView> {
+        self.windows.iter().chain(&self.additional_windows)
+    }
+}
+
+/// Hook render and the digest of its significant quota facts.
+pub(crate) struct HookBlock {
+    pub text: String,
+    pub digest: [u8; 32],
+}
+
+/// Keeps common labels short and quotes any text that could delimit a line.
+fn hook_label(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        value.to_owned()
+    } else {
+        json_ascii(value)
+    }
+}
+
+/// Renders shared counters once and names model-specific or differing counters.
+fn provider_line(provider: &HookProvider, at: f64) -> String {
+    let mut windows: Vec<(&WindowView, BTreeSet<&str>)> = Vec::new();
+    let mut models = Vec::new();
+    for model in &provider.models {
+        for window in model.windows() {
+            if let Some((_, names)) = windows.iter_mut().find(|(existing, _)| *existing == window) {
+                names.insert(model.model.as_str());
+            } else {
+                windows.push((window, BTreeSet::from([model.model.as_str()])));
+            }
+        }
+        let limiting = model
+            .limiting_window
+            .as_deref()
+            .map(display::window_label)
+            .map(hook_label);
+        let name = hook_label(&model.model);
+        let mut status = format!("{name} {}", model.status);
+        if let Some(reason) = display::reason(
+            &model.status,
+            limiting.as_deref(),
+            model.remaining_percent,
+            model.burn_percent_per_hour,
+        ) {
+            status.push_str(&format!(": {reason}"));
+        }
+        if model.evidence == "stale" {
+            status.push_str(&format!(
+                " ({})",
+                display::stale(model.newest_observed_at, at)
+            ));
+        }
+        if model.windows().next().is_none()
+            && let Some(window) = limiting
+        {
+            status.push_str(&format!(
+                " · {window} {}",
+                display::percent(model.remaining_percent)
+            ));
+            if let Some(reset) = model.reset_at.filter(|reset| *reset > at) {
+                status.push_str(&format!(" (reset {})", display::short_reset(reset, at)));
+            }
+        }
+        let badges = display::credit_badges(&model.ranking_credits);
+        if !badges.is_empty() {
+            status.push_str(&format!(" {}", badges.join(" ")));
+        }
+        models.push(status);
+    }
+    windows.sort_by_key(|(window, _)| (window.model_specific, window.window.as_str()));
+    let next_reset = windows
+        .iter()
+        .filter_map(|(window, _)| window.reset_at)
+        .filter(|reset| *reset > at)
+        .min_by(f64::total_cmp);
+    let mut facts = Vec::new();
+    for (window, names) in &windows {
+        let label = hook_label(display::window_label(&window.window));
+        let differing = windows.iter().any(|(other, _)| {
+            other.window == window.window && !other.model_specific && *other != *window
+        });
+        let label = if window.model_specific || differing {
+            let names: Vec<_> = names.iter().map(|name| hook_label(name)).collect();
+            format!("{} {label}", names.join("/"))
+        } else {
+            label
+        };
+        let mut fact = match (window.remaining_percent, window.last_remaining_percent) {
+            (None, Some(last)) => format!("{label} last {last:.0}%"),
+            (remaining, _) => format!("{label} {}", display::percent(remaining)),
+        };
+        if !window.known && window.observed_at.is_some() {
+            fact.push_str(&format!(" ({})", display::stale(window.observed_at, at)));
+        }
+        if window.reset_at == next_reset
+            && let Some(reset) = next_reset
+        {
+            fact.push_str(&format!(" (reset {})", display::short_reset(reset, at)));
+        }
+        facts.push(fact);
+    }
+    facts.extend(models);
+    format!("{}: {}", hook_label(&provider.provider), facts.join(" · "))
+}
+
+/// Fingerprints the ordered providers and significant model/window/credit changes.
+fn hook_digest(capacity: &HookCapacity) -> Option<[u8; 32]> {
+    let bucket = |percent: Option<f64>| percent.map(|percent| (percent / 10.0).floor() as u8);
+    let reset = |at: Option<f64>| at.map(|at| (at, at > capacity.evaluated_at));
+    let providers: Vec<_> = capacity
+        .providers
+        .iter()
+        .map(|provider| {
+            let models: Vec<_> = provider
+                .models
+                .iter()
+                .map(|model| {
+                    let windows: Vec<_> = model
+                        .windows()
+                        .map(|window| {
+                            (
+                                &window.window,
+                                &window.source,
+                                window.model_specific,
+                                window.known,
+                                bucket(window.remaining_percent.or(window.last_remaining_percent)),
+                                reset(window.reset_at),
+                            )
+                        })
+                        .collect();
+                    (
+                        &model.model,
+                        &model.status,
+                        &model.evidence,
+                        bucket(model.remaining_percent),
+                        reset(model.reset_at),
+                        windows,
+                        model.credit_availability,
+                        model.ranking_credits.reset_uses,
+                        model
+                            .ranking_credits
+                            .paid
+                            .as_ref()
+                            .map(|paid| paid.unlimited),
+                    )
+                })
+                .collect();
+            (&provider.provider, models)
+        })
+        .collect();
+    let bytes = serde_json::to_vec(&(&capacity.coverage.state, providers)).ok()?;
+    Some(Sha256::digest(bytes).into())
 }
 
 /// Renders the compact UserPromptSubmit block within `limit` characters (capped at 2500).
 ///
 /// Keeps the header and whole provider lines, adding an omission notice when
-/// lines are dropped. Returns an empty string for an invalid result or a budget
+/// lines are dropped. Returns no block for an invalid result or a budget
 /// too small for the header; the hook then prints nothing.
-pub(crate) fn hook_text(capacity: Value, limit: usize) -> String {
-    let Ok(capacity) = serde_json::from_value::<HookCapacity>(capacity) else {
-        return String::new();
-    };
+pub(crate) fn hook_block(capacity: Value, limit: usize) -> Option<HookBlock> {
+    let capacity = serde_json::from_value::<HookCapacity>(capacity).ok()?;
     if capacity.schema_version != SCHEMA_VERSION
         || capacity.providers.iter().any(|provider| {
             provider.models.iter().any(|model| {
@@ -552,33 +897,33 @@ pub(crate) fn hook_text(capacity: Value, limit: usize) -> String {
             })
         })
     {
-        return String::new();
+        return None;
     }
     let header = match capacity.coverage.state.as_str() {
         "complete" => HOOK_HEADER.to_owned(),
         "partial" | "unknown" => {
             format!("{HOOK_HEADER} Quota coverage: {}.", capacity.coverage.state)
         }
-        _ => return String::new(),
+        _ => return None,
     };
     let mut lines = vec![header];
     if capacity.providers.is_empty() {
         lines.push("No configured providers.".into());
     }
-    for (index, provider) in capacity.providers.iter().enumerate() {
-        let models = provider
-            .models
+    lines.extend(
+        capacity
+            .providers
             .iter()
-            .map(|model| format!("{}:{}", json_ascii(&model.model), model.status))
-            .collect::<Vec<_>>()
-            .join(",");
-        lines.push(format!(
-            "{}. provider={}; models=[{models}]",
-            index + 1,
-            json_ascii(&provider.provider)
-        ));
+            .map(|provider| provider_line(provider, capacity.evaluated_at)),
+    );
+    let text = truncate_lines(&lines, limit.min(HOOK_HARD_LIMIT_CHARS));
+    if text.is_empty() {
+        return None;
     }
-    truncate_lines(&lines, limit.min(HOOK_HARD_LIMIT_CHARS))
+    Some(HookBlock {
+        text,
+        digest: hook_digest(&capacity)?,
+    })
 }
 
 /// Keeps the header and whole following lines, appending the omission notice when needed.
@@ -799,8 +1144,10 @@ mod tests {
         assert_eq!(overflow.models[0].evidence, "stale");
         assert!(view.coverage.incomplete);
         assert!(
-            hook_text(serde_json::to_value(view).unwrap(), HOOK_DEFAULT_CHARS)
-                .contains("\"m1\":priority_overflow")
+            hook_block(serde_json::to_value(view).unwrap(), HOOK_DEFAULT_CHARS)
+                .unwrap()
+                .text
+                .contains("m1 priority_overflow")
         );
     }
 
@@ -925,39 +1272,170 @@ mod tests {
         assert!(rank(&config, bad, 1000.0).is_err());
     }
 
-    /// Hook lines keep agent-run's shape, escape labels and drop whole lines within budget.
+    /// Credit-backed options improve the order while schema-1 window statuses and base scores survive.
+    #[test]
+    fn credits_boost_capacity_without_changing_plan_evidence() {
+        let config = QuotaConfig::parse(
+            &[
+                source("a1", "alpha", &["m1"], None),
+                source("a2", "beta", &["m1"], None),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        let beta = account("a2", vec![model("beta", "m1", "known", Some(0.4), "low")]);
+        let rank_alpha = |alpha: &Value| {
+            serde_json::to_value(
+                rank(
+                    &config,
+                    snapshot("complete", vec![alpha.clone(), beta.clone()]),
+                    1000.0,
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        };
+        let mut alpha = account("a1", vec![model("alpha", "m1", "known", Some(0.3), "high")]);
+        let legacy = rank_alpha(&alpha);
+        assert_eq!(legacy["providers"][0]["provider"], "beta");
+        alpha["reset_credits"] =
+            json!({"known":true,"available_count":1,"observed_at":990.0,"credits":[]});
+        let reset = rank_alpha(&alpha);
+        assert_eq!(reset["schema_version"], 1);
+        assert_eq!(reset["providers"][0]["provider"], "alpha");
+        assert!((reset["providers"][0]["score"].as_f64().unwrap() - 0.45).abs() < 1e-9);
+        let original_fields = legacy["providers"][1]["models"][0].as_object().unwrap();
+        for (key, original) in original_fields {
+            if !matches!(
+                key.as_str(),
+                "ranking_priority" | "ranking_credits" | "credit_availability"
+            ) {
+                assert_eq!(&reset["providers"][0]["models"][0][key], original, "{key}");
+            }
+        }
+        assert_eq!(
+            reset["providers"][0]["models"][0]["ranking_credits"]["reset_uses"],
+            1
+        );
+
+        alpha["models"][0] = model("alpha", "m1", "exhausted", None, "high");
+        alpha["reset_credits"]["available_count"] = json!(2);
+        assert_eq!(rank_alpha(&alpha)["providers"][0]["provider"], "alpha");
+        alpha["reset_credits"]["credits"] = json!([
+            {"id":"wrong-scope","provider_kind":"GRANT","label":"reset","scope":"seven_day","usable_now":true},
+            {"id":"expired","provider_kind":"GRANT","label":"reset","scope":"five_hour","usable_now":true,"expires_at":1000.0},
+            {"id":"unusable","provider_kind":"GRANT","label":"reset","scope":"all","usable_now":false}
+        ]);
+        assert_eq!(rank_alpha(&alpha)["providers"][1]["score"], Value::Null);
+        alpha["credit_balance"] = json!({"has_credits":false,"unlimited":true,"balance":null});
+        let paid = rank_alpha(&alpha);
+        assert_eq!(paid["providers"][0]["provider"], "alpha");
+        assert_eq!(paid["providers"][0]["score"], 0.5);
+        let row = &paid["providers"][0]["models"][0];
+        assert_eq!(row["status"], "exhausted");
+        assert_eq!(row["best_priority"], Value::Null);
+        assert_eq!(row["exhausted_until"], 1500.0);
+        assert_eq!(row["ranking_priority"], 0.5);
+        alpha["models"][0] = model("alpha", "m1", "unknown", None, "unknown");
+        assert_eq!(rank_alpha(&alpha)["providers"][1]["score"], Value::Null);
+    }
+
+    /// A shared window is rendered once and scoped weekly quota keeps its model label.
+    #[test]
+    fn hook_renders_shared_and_scoped_windows_and_tracks_significant_changes() {
+        let at = 1795798740.0;
+        let window = |name, remaining, reset, model_specific| {
+            json!({"source":"fixture","window":name,"known":true,"remaining_percent":remaining,
+                "reset_at":reset,"model_specific":model_specific})
+        };
+        let shared = vec![
+            window("five_hour", 64.4, 1795803060.0, false),
+            window("seven_day", 73.0, 1796331540.0, false),
+        ];
+        let mut fable = shared.clone();
+        fable.push(window("seven_day", 63.0, 1796331540.0, true));
+        let capacity = json!({"schema_version":1,"evaluated_at":at,"coverage":{"state":"complete"},
+            "providers":[{"provider":"claude","models":[
+                {"model":"sonnet","status":"available","windows":shared},
+                {"model":"fable","status":"limited","limiting_window":"seven_day","remaining_percent":63.0,
+                 "burn_percent_per_hour":20.0,"windows":fable}
+            ]},{"provider":"glm","models":[{"model":"glm","status":"unknown"}]}]});
+        let render = |value| hook_block(value, HOOK_DEFAULT_CHARS).unwrap();
+        let original = render(capacity.clone());
+        assert_eq!(
+            original.text,
+            concat!(
+                "Quota update · provider capacity order (highest first, resets in UTC).\n",
+                "claude: 5h 64% (reset 18:11) · 7d 73% · fable 7d 63% · sonnet available · ",
+                "fable limited: 7d window 63% left, burn 20.0%/h → runs out before reset\n",
+                "glm: glm unknown"
+            )
+        );
+        let mut drift = capacity.clone();
+        drift["evaluated_at"] = json!(at + 60.0);
+        drift["providers"][0]["models"][1]["burn_percent_per_hour"] = json!(20.7);
+        drift["providers"][0]["models"][1]["windows"][2]["remaining_percent"] = json!(69.9);
+        assert_eq!(render(drift.clone()).digest, original.digest);
+        drift["providers"][0]["models"][1]["windows"][2]["remaining_percent"] = json!(70.0);
+        assert_ne!(render(drift).digest, original.digest);
+        for (pointer, value) in [
+            ("/providers/0/models/1/status", json!("exhausted")),
+            (
+                "/providers/0/models/1/windows/2/reset_at",
+                json!(1796331541.0),
+            ),
+            ("/providers/0/models/1/credit_availability", json!([1, 0])),
+            ("/providers/0/models/1/credit_availability", json!([0, 1])),
+            ("/evaluated_at", json!(1795803060.0)),
+        ] {
+            let mut changed = capacity.clone();
+            if pointer.ends_with("/credit_availability") {
+                changed["providers"][0]["models"][1]["credit_availability"] = value;
+            } else {
+                *changed.pointer_mut(pointer).unwrap() = value;
+            }
+            assert_ne!(render(changed).digest, original.digest, "{pointer}");
+        }
+        let mut reordered = capacity;
+        reordered["providers"].as_array_mut().unwrap().reverse();
+        assert_ne!(render(reordered).digest, original.digest);
+    }
+
+    /// Hook lines escape labels and drop whole provider lines within budget.
     #[test]
     fn hook_text_is_compact_escaped_and_bounded() {
-        let capacity = json!({"schema_version":1,"coverage":{"state":"complete","incomplete":false},
+        let capacity = json!({"schema_version":1,"evaluated_at":0,"coverage":{"state":"complete","incomplete":false},
             "providers":[{"provider":"alpha","models":[{"model":"m\u{2028}1","status":"available"},{"model":"m2","status":"exhausted"}]},
                          {"provider":"beta","models":[{"model":"m1","status":"unknown"},{"model":"long-model-name-that-does-not-fit","status":"unknown"}]}]});
-        let text = hook_text(capacity.clone(), HOOK_DEFAULT_CHARS);
+        let render =
+            |value, limit| hook_block(value, limit).map_or_else(String::new, |block| block.text);
+        let text = render(capacity.clone(), HOOK_DEFAULT_CHARS);
         let lines: Vec<_> = text.lines().collect();
         assert_eq!(lines.len(), 3);
-        assert!(lines[0].starts_with("Provider capacity order (highest first; read-only"));
+        assert_eq!(lines[0], HOOK_HEADER);
         assert_eq!(
             lines[1],
-            "1. provider=\"alpha\"; models=[\"m\\u20281\":available,\"m2\":exhausted]"
+            "alpha: \"m\\u20281\" available · m2 exhausted: plan window has no usable quota"
         );
         assert_eq!(
             lines[2],
-            "2. provider=\"beta\"; models=[\"m1\":unknown,\"long-model-name-that-does-not-fit\":unknown]"
+            "beta: m1 unknown · long-model-name-that-does-not-fit unknown"
         );
         let budget = HOOK_HEADER.chars().count()
             + 1
             + lines[1].chars().count()
             + 1
             + HOOK_OMITTED.chars().count();
-        let short = hook_text(capacity.clone(), budget);
+        let short = render(capacity.clone(), budget);
         assert!(short.chars().count() <= budget);
         assert!(short.ends_with(HOOK_OMITTED));
         assert_eq!(short.lines().count(), 3);
-        assert!(hook_text(capacity.clone(), 10).is_empty());
-        assert!(hook_text(capacity.clone(), 100_000).chars().count() <= HOOK_HARD_LIMIT_CHARS);
+        assert!(render(capacity.clone(), 10).is_empty());
+        assert!(render(capacity.clone(), 100_000).chars().count() <= HOOK_HARD_LIMIT_CHARS);
         let mut partial = capacity.clone();
         partial["coverage"]["state"] = json!("partial");
         assert!(
-            hook_text(partial, HOOK_DEFAULT_CHARS)
+            render(partial, HOOK_DEFAULT_CHARS)
                 .lines()
                 .next()
                 .unwrap()
@@ -965,6 +1443,6 @@ mod tests {
         );
         let mut invalid = capacity;
         invalid["providers"][0]["models"][0]["status"] = json!("unsupported");
-        assert!(hook_text(invalid, HOOK_DEFAULT_CHARS).is_empty());
+        assert!(render(invalid, HOOK_DEFAULT_CHARS).is_empty());
     }
 }

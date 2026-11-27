@@ -67,6 +67,12 @@ pub struct ProviderRanking {
     /// capacity ranking then uses neutral account weights for this provider.
     #[serde(default)]
     pub ordered_accounts: bool,
+    /// Unweighted capacity floor when a banked reset can help the limiting window.
+    #[serde(default = "reset_credit_floor")]
+    pub reset_credit_floor: f64,
+    /// Unweighted capacity added for available Codex paid credits.
+    #[serde(default = "paid_credit_bonus")]
+    pub paid_credit_bonus: f64,
 }
 
 impl Default for ProviderRanking {
@@ -75,8 +81,18 @@ impl Default for ProviderRanking {
         Self {
             priority_multiplier: 1.0,
             ordered_accounts: false,
+            reset_credit_floor: reset_credit_floor(),
+            paid_credit_bonus: paid_credit_bonus(),
         }
     }
+}
+
+fn reset_credit_floor() -> f64 {
+    0.25
+}
+
+fn paid_credit_bonus() -> f64 {
+    0.5
 }
 
 /// Whether quota is collected by an external executable or remains unobserved.
@@ -268,6 +284,8 @@ impl QuotaConfig {
         for (provider, ranking) in &self.providers {
             if !provider_identifier(provider)
                 || !positive_finite(ranking.priority_multiplier)
+                || !(0.0..=2.0).contains(&ranking.reset_credit_floor)
+                || !(0.0..=2.0).contains(&ranking.paid_credit_bonus)
                 || !self
                     .sources
                     .iter()

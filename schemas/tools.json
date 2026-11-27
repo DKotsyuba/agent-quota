@@ -21,7 +21,7 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Read stored quota metrics and account reset credits from the local service. Does not contact providers or start models. Narrow account or model scope if the result is too large.",
+    "description": "Read stored per-account quota windows, reset times, risk reasons, reset credits, and Codex paid balances. Does not contact providers or start models. Narrow account or model scope if the result is too large.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -51,7 +51,7 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Rank configured providers and their models by stored quota capacity (highest first), applying Quota's provider and account multipliers. Shows each model's status (available, limited, unknown, priority_overflow, exhausted), remaining percentage, limiting window, reset and evidence freshness. Account-free: no account or pool identities. Read-only; does not contact providers or start models.",
+    "description": "Rank configured providers by stored window and credit capacity, applying provider and account multipliers. Shows model statuses and reasons, remaining percentages and resets for each window, stale evidence, and ranking credits without account or pool identities. Read-only; does not contact providers or start models.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {

@@ -19,8 +19,8 @@ Read AGENTS.md and docs/MCP_RESPONSE_STANDARD.md before adding tools.
 | Tool | Effect | Purpose |
 |---|---|---|
 | `get_status` | read | product name, version and release qualification |
-| `get_capacity` | read | account-free provider/model capacity order (highest first) with status, remaining percentage, limiting window, reset and freshness; optional model filter |
-| `get_quota` | read | stored per-account quota metrics and advice; optional account/model filters |
+| `get_capacity` | read | account-free provider/model capacity order with status reasons, quota windows, resets and ranking credits; optional model filter |
+| `get_quota` | read | stored per-account quota windows, risk reasons and credit balances; optional account/model filters |
 
 Neither tool contacts a provider. `get_capacity` is the orchestrator view: it
 applies the provider and account multipliers from the [configuration](docs/configuration.md)
@@ -32,11 +32,44 @@ machine-readable response.
 ### UserPromptSubmit hook
 
 `agent-quota hook context [--host claude|codex] [--socket PATH] [--server-uid UID] [--max-chars N]`
-prints the compact provider capacity order as a `UserPromptSubmit`
-`additionalContext` envelope (default budget 1899 characters, capped at 2500).
-It reads the local service once with a 750 ms deadline, writes nothing, and
-on any error prints nothing and exits 0. It is stateless, so it injects the
-block on every prompt; agent-run previously injected it only when it changed.
+prints a compact **Quota update** with one line per ranked provider, its windows
+and next reset, and model statuses. The `UserPromptSubmit` context envelope
+defaults to 1899 characters and caps at 2500.
+
+Register the same command for `UserPromptSubmit` and add a `SessionStart` entry
+to the host's `hooks` object. This example uses Claude Code's settings JSON.
+For Codex `hooks.json`, use `--host codex` in both commands.
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {"hooks": [{"type": "command", "command": "agent-quota hook context --host claude"}]}
+    ],
+    "SessionStart": [
+      {
+        "matcher": "^(compact|clear|resume)$",
+        "hooks": [{"type": "command", "command": "agent-quota hook context --host claude"}]
+      }
+    ]
+  }
+}
+```
+
+Use the same socket and service UID options as your existing hook if needed.
+`SessionStart` clears the caller's marker so the next prompt refreshes quota
+context. On each prompt the hook reads the service once within 750 ms. It
+emits on a session's first prompt or a change in model status, provider order,
+credit availability, window reset, or 10-point remaining quota bucket. An
+unchanged prompt or an error produces no output and exits 0. Missing or invalid
+hook input falls back to emitting on each successful read.
+
+The hook keeps only session hashes and quota digests under
+`${XDG_STATE_HOME:-$HOME/.local/state}/agent-quota/hook` (directory mode `0700`,
+file mode `0600`). The most recent 256 injected sessions share the ledger,
+with separate keys for Claude Code and Codex. See the host references for
+[Claude Code hooks](https://code.claude.com/docs/en/hooks) and
+[Codex hooks](https://developers.openai.com/codex/hooks).
 
 ## Run locally
 

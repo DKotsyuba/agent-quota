@@ -190,17 +190,34 @@ The ranking is agent-run's former provider capacity order, now owned by Quota:
   `priority_overflow`. An expired bound or other unavailable evidence is unknown.
 - Model `status`: `available` if any account has known capacity at low or
   medium risk; `limited` if all accounts with known capacity are at `high`
-  risk (the existing forecast rule: at most 10% remaining, or burn above the
-  sustainable rate). With no known priority, the status is `unknown` if any
+  risk (at most 10% remaining, or with sufficient evidence, burn above 1.5
+  times the sustainable rate after the remaining quota exceeds 30%).
+  With no known priority, the status is `unknown` if any
   eligible lane is unknown, `priority_overflow` if any overflows, and
   `exhausted` otherwise. `best_priority` is the highest known priority.
 - `evidence` is `fresh` for a known or exhausted decision, `stale` when
   samples exist but yield no known priority or exhaustion decision, and
   `missing` otherwise.
   `exhausted_until` is the earliest known reset of the exhausted accounts.
-- Provider `score` is the best model priority times the provider
+- Model `ranking_priority` is the highest credit-adjusted account priority.
+  For each known or exhausted binding, start with its plan score (zero for
+  exhaustion). If usable reset credits cover the limiting window, apply the
+  configured reset floor and then Agent Run's historical multiplier
+  `1 + n/(n + 1)`, where `n` is the number of usable resets. An inventory
+  containing only a count uses the reported count. With individual rows,
+  only usable, started, unexpired rows with the matching window, model,
+  or `all` scope count. A usable row with no reported uses counts as one.
+  For Codex bindings, add the configured paid credit bonus when
+  `has_credits || unlimited`. Apply the account multiplier to the result.
+  An exhausted binding can contribute a positive priority this way while
+  retaining its exhausted plan status. Unknown bindings remain unscored.
+- `ranking_credits` carries the adjusted winner's `reset_uses` count and
+  nullable `paid` balance. `credit_availability` contains two counts for the
+  model's eligible bindings: total applicable reset uses and number reporting
+  available Codex paid credits. This method omits credit IDs.
+- Provider `score` is the best `ranking_priority` times the provider
   `priority_multiplier` (saturated at the largest finite number), or null
-  without known capacity. Providers sort by descending score, then best
+  without a scored model. Providers sort by descending score, then best
   model status in Agent Run's order (known, `unknown`, `priority_overflow`,
   `exhausted`), then name. Both `available` and `limited` count as known.
 - For a scored row, `native_model`, `limiting_window`, `remaining_percent`,
@@ -208,7 +225,10 @@ The ranking is agent-run's former provider capacity order, now owned by Quota:
   account and native lane that supplied `best_priority`. The status still
   summarizes all eligible lanes and `newest_observed_at` uses their newest
   observation. Exhausted rows use the soonest-reset exhausted lane for those
-  details. Unknown and overflow rows have no representative details.
+  details. The optional `additional_windows` contains counters beyond the
+  first eight, or counters from the newest matching lane for unknown and
+  overflow rows. Model rows add `burn_percent_per_hour`. Window rows add
+  `last_remaining_percent`, `burn_percent_per_hour`, and `model_specific`.
 - `coverage.incomplete` is true when collection coverage is not `complete` or
   any eligible lane is unknown or its weighted priority overflows.
 
@@ -216,7 +236,8 @@ No account, pool, credential or source-command identity is returned. The
 order is quota-only: account enablement, cooldowns, pins and active-attempt
 limits are agent-run admission state and are not applied. Like the snapshot,
 the result is an estimate at `evaluated_at`, not a reservation; a client must
-not use it as an admission fence.
+not use it as an admission fence. Automated admission uses its own snapshot
+adapter. This ranking has no redemption or spending effect.
 
 ## Reset-credit redemption
 
