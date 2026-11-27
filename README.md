@@ -36,9 +36,8 @@ prints a compact **Quota update** with one line per ranked provider, its windows
 and next reset, and model statuses. The `UserPromptSubmit` context envelope
 defaults to 1899 characters and caps at 2500.
 
-Register the same command for `UserPromptSubmit` and add a `SessionStart` entry
-to the host's `hooks` object. This example uses Claude Code's settings JSON.
-For Codex `hooks.json`, use `--host codex` in both commands.
+Merge these entries into the `hooks` object in Claude Code settings.json
+(for example, `~/.claude/settings.json`).
 
 ```json
 {
@@ -48,7 +47,7 @@ For Codex `hooks.json`, use `--host codex` in both commands.
     ],
     "SessionStart": [
       {
-        "matcher": "^(compact|clear|resume)$",
+        "matcher": "compact|clear|resume",
         "hooks": [{"type": "command", "command": "agent-quota hook context --host claude"}]
       }
     ]
@@ -56,15 +55,35 @@ For Codex `hooks.json`, use `--host codex` in both commands.
 }
 ```
 
+For Codex, merge these entries into `~/.codex/config.toml` (or the
+corresponding file in `CODEX_HOME`). Approve the managed hooks in Codex if
+the host prompts for trust.
+
+```toml
+[[hooks.UserPromptSubmit]]
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = "agent-quota hook context --host codex"
+
+[[hooks.SessionStart]]
+matcher = "compact|clear|resume"
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = "agent-quota hook context --host codex"
+```
+
 Use the same socket and service UID options as your existing hook if needed.
-`SessionStart` clears the caller's marker so the next prompt refreshes quota
+`SessionStart` invalidates the caller's quota digest so the next prompt refreshes quota
 context. On each prompt the hook reads the service once within 750 ms. It
 emits on a session's first prompt or a change in model status, provider order,
 credit availability, window reset, or 10-point remaining quota bucket. An
-unchanged prompt or an error produces no output and exits 0. Missing or invalid
+unreachable service yields one `Quota unavailable since HH:MMZ` context line
+for a tracked session that received quota context, followed by silence until
+recovery. The first successful block after recovery is delivered even if quota
+is unchanged. All hook outcomes exit 0. Missing or invalid
 hook input falls back to emitting on each successful read.
 
-The hook keeps only session hashes and quota digests under
+The hook keeps only session hashes with quota digests or delivery markers under
 `${XDG_STATE_HOME:-$HOME/.local/state}/agent-quota/hook` (directory mode `0700`,
 file mode `0600`). The most recent 256 injected sessions share the ledger,
 with separate keys for Claude Code and Codex. See the host references for

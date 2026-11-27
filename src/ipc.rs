@@ -27,6 +27,9 @@ use tokio::time::{Instant, timeout, timeout_at};
 
 const MAX_REQUEST: usize = 64 * 1024;
 const MAX_OWNER_REQUEST: usize = 4 * 1024 * 1024;
+/// Maximum sample size per filter in the scope options response.
+pub(crate) const SCOPE_SAMPLE_SIZE: usize = 6;
+
 const MAX_REPLY: usize = 4 * 1024 * 1024;
 const MAX_CONNECTIONS: usize = 32;
 const DEADLINE: Duration = Duration::from_secs(5);
@@ -211,7 +214,7 @@ fn validate_request(request: &Request) -> Result<(), &'static str> {
         _ => {}
     }
     match request.method.as_str() {
-        "status"
+        "status" | "scope_options"
             if request.accounts.is_empty()
                 && request.model.is_none()
                 && request.observation.is_none() =>
@@ -243,7 +246,7 @@ fn validate_request(request: &Request) -> Result<(), &'static str> {
         {
             Ok(())
         }
-        "status" | "snapshot" | "capacity" | "ingest" => Err("invalid_request"),
+        "status" | "scope_options" | "snapshot" | "capacity" | "ingest" => Err("invalid_request"),
         _ => Err("unsupported_method"),
     }
 }

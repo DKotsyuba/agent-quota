@@ -102,8 +102,24 @@ fn private_file(path: &Path, create: bool) -> io::Result<File> {
     Ok(file)
 }
 
-/// Oldest last-injected session comes first. Keys and payloads are SHA-256 digests.
-type Sessions = Vec<([u8; 32], [u8; 32])>;
+/// Last delivered context. Existing ledger digests retain their serialized shape.
+#[derive(serde::Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+enum Delivery {
+    Quota([u8; 32]),
+    Marker(DeliveryMarker),
+}
+
+/// A delivered block needs refresh after a lifecycle event or an outage.
+#[derive(serde::Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum DeliveryMarker {
+    RefreshPending,
+    Unavailable,
+}
+
+/// Oldest last-injected session comes first. Keys are SHA-256 digests.
+type Sessions = Vec<([u8; 32], Delivery)>;
 
 /// Runs a state operation under a nonblocking private file lock, then publishes by rename.
 fn update(
@@ -152,14 +168,20 @@ fn update(
     fs::rename(temporary, state)
 }
 
-/// Invalidates this session without a service read or a context envelope.
+/// Invalidates the digest while retaining delivery history without a service read.
 pub(crate) fn invalidate(base: &Path, key: [u8; 32]) -> io::Result<()> {
     update(
         base,
         |entries| {
-            let previous = entries.len();
-            entries.retain(|(session, _)| session != &key);
-            previous != entries.len()
+            let Some((_, delivery)) = entries.iter_mut().find(|(session, _)| session == &key)
+            else {
+                return false;
+            };
+            if !matches!(delivery, Delivery::Quota(_)) {
+                return false;
+            }
+            *delivery = Delivery::Marker(DeliveryMarker::RefreshPending);
+            true
         },
         || Ok(()),
     )
@@ -175,17 +197,50 @@ pub(crate) fn inject(
     update(
         base,
         |entries| {
-            if entries
-                .iter()
-                .any(|(session, digest)| session == &key && digest == &block.digest)
-            {
+            if entries.iter().any(|(session, digest)| {
+                session == &key && digest == &Delivery::Quota(block.digest)
+            }) {
                 return false;
             }
             entries.retain(|(session, _)| session != &key);
-            entries.push((key, block.digest));
+            entries.push((key, Delivery::Quota(block.digest)));
             true
         },
         || emit(&block.text),
+    )
+}
+
+/// Reports the first unreachable read after a delivered block and records successful output.
+pub(crate) fn unavailable(
+    base: &Path,
+    key: [u8; 32],
+    emit: impl FnOnce(&str) -> io::Result<()>,
+) -> io::Result<()> {
+    update(
+        base,
+        |entries| {
+            let Some(index) = entries.iter().position(|(session, delivery)| {
+                session == &key
+                    && !matches!(delivery, Delivery::Marker(DeliveryMarker::Unavailable))
+            }) else {
+                return false;
+            };
+            entries.remove(index);
+            entries.push((key, Delivery::Marker(DeliveryMarker::Unavailable)));
+            true
+        },
+        || {
+            let minutes = std::time::UNIX_EPOCH
+                .elapsed()
+                .unwrap_or_default()
+                .as_secs()
+                / 60;
+            emit(&format!(
+                "Quota unavailable since {:02}:{:02}Z",
+                minutes / 60 % 24,
+                minutes % 60
+            ))
+        },
     )
 }
 

@@ -184,6 +184,9 @@ source = "fixture-source"
         serde_json::from_slice::<Value>(&ready.stdout).unwrap()["service"],
         "running"
     );
+    let scope = request(&socket, "scope_options").await;
+    assert_eq!(scope["result"]["accounts"], json!(["fixture"]));
+    assert_eq!(scope["result"]["models"], json!(["model-a"]));
     let epoch = first["result"]["source_epoch"].as_str().unwrap().to_owned();
     let second = wait_for(&socket, "snapshot", |value| {
         value["result"]["accounts"][0]["windows"][0]["forecast"]["burn_percent_per_hour"]
@@ -671,6 +674,7 @@ async fn hook_context_reinjects_only_for_changed_session_context() {
             make_capacity("limited", 70.0),
             make_capacity("limited", 70.0),
             make_capacity("limited", 70.0),
+            make_capacity("limited", 70.0),
         ] {
             let (stream, _) = listener.accept().await.unwrap();
             let mut stream = BufReader::new(stream);
@@ -722,13 +726,33 @@ async fn hook_context_reinjects_only_for_changed_session_context() {
             .await
             .contains("gpt limited")
     );
+    let absent = root.path().join("absent.sock");
+    assert!(run("claude", absent.clone(), prompt).await.is_empty());
+    let outage = run("codex", absent.clone(), prompt).await;
+    let envelope: Value = serde_json::from_str(&outage).unwrap();
+    let context = envelope["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
+    let stamp = context.strip_prefix("Quota unavailable since ").unwrap();
+    assert_eq!(stamp.len(), 6);
+    assert!(stamp.ends_with('Z') && !stamp.contains('\n'));
+    assert!(run("codex", absent, prompt).await.is_empty());
+    assert!(
+        run("codex", socket.clone(), prompt)
+            .await
+            .contains("gpt limited")
+    );
     let compact =
         br#"{"session_id":"example","hook_event_name":"SessionStart","source":"compact"}"#;
+    let absent = root.path().join("absent.sock");
+    assert!(run("codex", absent.clone(), compact).await.is_empty());
     assert!(
-        run("codex", root.path().join("absent.sock"), compact)
+        run("codex", absent.clone(), prompt)
             .await
-            .is_empty()
+            .contains("Quota unavailable since ")
     );
+    assert!(run("codex", absent.clone(), compact).await.is_empty());
+    assert!(run("codex", absent, prompt).await.is_empty());
     assert!(
         run("codex", socket.clone(), prompt)
             .await

@@ -257,11 +257,55 @@ enum ReleaseCommand {
         bin_dir: PathBuf,
     },
 }
+/// Minimum time between service version probes for each MCP frontend.
+const VERSION_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Serializes checks and retains the first confirmed skew until the client reconnects.
+#[derive(Default)]
+struct ServiceVersionCheck {
+    checked_at: Option<tokio::time::Instant>,
+    mismatch: Option<String>,
+    notified: bool,
+}
+
+/// Reads authenticated service status, including version when the service supplies it.
+async fn service_status(path: &std::path::Path, uid: u32) -> Option<serde_json::Value> {
+    let request = ipc::Request {
+        version: 1,
+        method: "status".into(),
+        ..Default::default()
+    };
+    match ipc::request(path, &request, uid).await {
+        Ok(ipc::Reply::Result { result, .. }) if result["status"] == "running" => Some(result),
+        _ => None,
+    }
+}
+
+/// Accepts bounded release identifiers without echoing arbitrary socket strings.
+fn running_version(status: &serde_json::Value) -> Option<&str> {
+    status["version"].as_str().filter(|version| {
+        !version.is_empty()
+            && version.len() <= 128
+            && version
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b".+-".contains(&byte))
+    })
+}
+
+/// Gives both supported hosts the recovery action for a confirmed mismatch.
+fn reconnect_message(version: &str) -> String {
+    format!(
+        "agent-quota service is {version}, this MCP frontend is {}: reconnect the agent-quota MCP server (Claude Code: /mcp → reconnect; Codex: restart the session)",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
 #[derive(Clone)]
 struct Handler {
     identity: Arc<Renderer>,
     templates: Arc<response::Templates>,
     catalog: Vec<Tool>,
+    version_check: Arc<tokio::sync::Mutex<ServiceVersionCheck>>,
     socket: Option<PathBuf>,
     server_uid: u32,
 }
@@ -275,17 +319,67 @@ impl Handler {
             identity: Arc::new(identity),
             templates: Arc::new(templates),
             catalog,
+            version_check: Default::default(),
             socket,
             server_uid,
         })
     }
+    /// Probes at most once per interval and sends one catalog invalidation after handshake.
+    async fn check_version(
+        &self,
+        peer: Option<&rmcp::service::Peer<RoleServer>>,
+    ) -> Option<String> {
+        let path = self.socket.as_deref()?;
+        let mut state = self.version_check.lock().await;
+        if state.mismatch.is_none()
+            && state
+                .checked_at
+                .is_none_or(|at| at.elapsed() >= VERSION_CHECK_INTERVAL)
+        {
+            state.checked_at = Some(tokio::time::Instant::now());
+            let status = service_status(path, self.server_uid).await;
+            state.mismatch = status
+                .as_ref()
+                .and_then(running_version)
+                .filter(|version| *version != env!("CARGO_PKG_VERSION"))
+                .map(str::to_owned);
+        }
+        let version = state.mismatch.clone()?;
+        if let Some(peer) = peer
+            && !state.notified
+        {
+            state.notified = true;
+            drop(state);
+            let _ = peer.notify_tool_list_changed().await;
+        }
+        Some(reconnect_message(&version))
+    }
 }
 impl ServerHandler for Handler {
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().enable_tool_list_changed().build())
             .with_server_info(Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
             .with_instructions("Use get_status for identity, get_capacity for the account-free provider/model capacity order and get_quota for per-account quota observations. Tool descriptions define effects.")
     }
+    /// Check the resident service before completing a legacy initialization.
+    async fn initialize(
+        &self,
+        request: InitializeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<InitializeResult, McpError> {
+        context.peer.set_peer_info(request.clone());
+        let mut info = self.negotiate_initialize(&request)?;
+        if let Some(message) = self.check_version(None).await {
+            info.instructions = Some(message);
+        }
+        Ok(info)
+    }
+
+    /// Notify initialized legacy clients of any mismatch found at initialization.
+    async fn on_initialized(&self, context: rmcp::service::NotificationContext<RoleServer>) {
+        let _ = self.check_version(Some(&context.peer)).await;
+    }
+
     /// Return the static catalog; modern requests cache it privately for 60 seconds.
     /// Pagination is unused; legacy sessions retain their original wire fields.
     async fn list_tools(
@@ -307,8 +401,11 @@ impl ServerHandler for Handler {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
+        if let Some(message) = self.check_version(Some(&context.peer)).await {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(message)]).into());
+        }
         let args = serde_json::Value::Object(request.arguments.unwrap_or_default());
         let reply = tools::call(
             &request.name,
@@ -501,8 +598,26 @@ async fn read_service(
         observation: None,
         ..Default::default()
     };
-    match ipc::request(&path, &request, server_uid.unwrap_or_else(ipc::owner_uid)).await {
-        Ok(ipc::Reply::Result { result, .. }) => print_json(result),
+    let uid = server_uid.unwrap_or_else(ipc::owner_uid);
+    match ipc::request(&path, &request, uid).await {
+        Ok(ipc::Reply::Result { result, .. }) => {
+            if method == "status"
+                && let Some(version) = running_version(&result)
+                && version != env!("CARGO_PKG_VERSION")
+            {
+                eprintln!("quota: {}", reconnect_message(version));
+            }
+            print_json(result)
+        }
+        Ok(ipc::Reply::Error { error, .. })
+            if error == "response_too_large" && method != "status" =>
+        {
+            eprintln!(
+                "quota: {}",
+                tools::narrowing_message(&path, uid, method == "snapshot", true).await
+            );
+            ExitCode::FAILURE
+        }
         Ok(ipc::Reply::Error { error, .. }) | Err(error) => {
             eprintln!("quota: {error}");
             ExitCode::FAILURE
@@ -546,7 +661,14 @@ async fn hook_context(
         }
         hook::Event::Ignore => return,
     };
+    let scoped = key.zip(hook::state_home());
+    let unavailable = || {
+        if let Some((key, base)) = &scoped {
+            let _ = hook::unavailable(base, *key, print_context);
+        }
+    };
     let Ok(path) = socket_path(socket) else {
+        unavailable();
         return;
     };
     let request = ipc::Request {
@@ -558,21 +680,25 @@ async fn hook_context(
         ..Default::default()
     };
     let uid = server_uid.unwrap_or_else(ipc::owner_uid);
-    if let Ok(Ok(ipc::Reply::Result { result, .. })) =
-        tokio::time::timeout_at(deadline, ipc::request(&path, &request, uid)).await
-        && let Some(block) = capacity::hook_block(result, max_chars)
+    let result = match tokio::time::timeout_at(deadline, ipc::request(&path, &request, uid)).await {
+        Ok(Ok(ipc::Reply::Result { result, .. })) => result,
+        Ok(Ok(ipc::Reply::Error { error, .. }) | Err(error)) if error != "unavailable" => return,
+        _ => {
+            unavailable();
+            return;
+        }
+    };
+    if let Some(block) = capacity::hook_block(result, max_chars)
         && tokio::time::Instant::now() < deadline
     {
-        if let Some(key) = key {
-            if let Some(base) = hook::state_home() {
-                let _ = hook::inject(&base, key, block, |text| {
-                    if tokio::time::Instant::now() >= deadline {
-                        return Err(std::io::ErrorKind::TimedOut.into());
-                    }
-                    print_context(text)
-                });
-            }
-        } else {
+        if let Some((key, base)) = scoped {
+            let _ = hook::inject(&base, key, block, |text| {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(std::io::ErrorKind::TimedOut.into());
+                }
+                print_context(text)
+            });
+        } else if key.is_none() {
             let _ = print_context(&block.text);
         }
     }
@@ -851,26 +977,19 @@ async fn main() -> ExitCode {
             server_uid,
         } => {
             let frontend_ready = Handler::new(None, ipc::owner_uid()).is_ok();
-            let service_ready = match socket_path(socket) {
-                Ok(path) => {
-                    let request = ipc::Request {
-                        version: 1,
-                        method: "status".into(),
-                        accounts: Vec::new(),
-                        model: None,
-                        observation: None,
-                        ..Default::default()
-                    };
-                    matches!(ipc::request(&path, &request, server_uid.unwrap_or_else(ipc::owner_uid)).await,
-                        Ok(ipc::Reply::Result { result, .. }) if result["status"] == "running")
-                }
-                Err(_) => false,
+            let status = match socket_path(socket) {
+                Ok(path) => service_status(&path, server_uid.unwrap_or_else(ipc::owner_uid)).await,
+                Err(_) => None,
             };
-            let ready = frontend_ready && service_ready;
+            let service_ready = status.is_some();
+            let version = status.as_ref().and_then(running_version);
+            let skew = version.filter(|value| *value != env!("CARGO_PKG_VERSION"));
+            let ready = frontend_ready && service_ready && skew.is_none();
             let output = print_json(
                 serde_json::json!({"product":env!("CARGO_PKG_NAME"),"version":env!("CARGO_PKG_VERSION"),
                 "local_ready":ready,"frontend_ready":frontend_ready,
                 "service":if service_ready { "running" } else { "unavailable" },
+                "service_version":version, "version_skew":skew.map(reconnect_message),
                 "release_qualification":qualification(),"incomplete_tools":tools::incomplete()}),
             );
             if ready { output } else { ExitCode::from(2) }
@@ -978,7 +1097,7 @@ async fn main() -> ExitCode {
                     max_chars,
                 },
         } => {
-            // The hook must never break the host: every outcome is a silent exit 0.
+            // Every hook outcome exits successfully without diagnostics.
             hook_context(host, socket, server_uid, max_chars).await;
             ExitCode::SUCCESS
         }

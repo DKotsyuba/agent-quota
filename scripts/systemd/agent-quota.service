@@ -1,0 +1,16 @@
+[Unit]
+Description=Agent Quota resident service
+After=systemd-tmpfiles-setup.service
+
+[Service]
+Type=exec
+User=quota-service
+Group=quota-service
+StateDirectory=agent-quota
+StateDirectoryMode=0700
+Environment=TMPDIR=/var/lib/agent-quota/tmp
+ExecStartPre=/usr/bin/mkdir -p -m 0700 /var/lib/agent-quota/tmp
+ExecStart=/usr/local/bin/agent-quota serve --home /var/lib/agent-quota --config /etc/agent-quota/config.toml --socket /run/agent-quota/quota.sock
+
+[Install]
+WantedBy=multi-user.target

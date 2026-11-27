@@ -12,6 +12,7 @@ Clients must configure the expected service UID when it differs from their own.
 
 ```json
 {"version":1,"method":"status","accounts":[]}
+{"version":1,"method":"scope_options"}
 {"version":1,"method":"snapshot","accounts":["account-example"],"model":"model-example"}
 {"version":1,"method":"capacity","accounts":[],"model":"model-example"}
 ```
@@ -20,7 +21,10 @@ For `snapshot`, omitted or empty `accounts` means all configured accounts;
 `model` is optional and matches a configured or native model name. The result is
 `{"version":1,"result":{...}}`; a failure is
 `{"version":1,"error":"safe_code"}`. `status` reports the latest collection
-round and external-ingest status without credentials or raw collector output.
+round, external-ingest status and service binary version. Older builds may
+omit the version. `scope_options` returns bounded configured `accounts` and
+`models` samples for narrowing oversized reads. `more_accounts` and
+`more_models` indicate samples with additional candidates.
 The client must reject unsupported protocol or snapshot schema versions and
 unknown state values rather than treating them as available capacity.
 

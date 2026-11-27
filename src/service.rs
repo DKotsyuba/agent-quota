@@ -224,9 +224,29 @@ impl Engine {
             .cloned()
             .collect();
         Ok(
-            json!({"product":"agent-quota", "status":"running", "started_at":self.started_at,
+            json!({"product":"agent-quota", "version":env!("CARGO_PKG_VERSION"), "status":"running", "started_at":self.started_at,
             "source_count":source_count, "last_collection":last_round, "external_collection":external}),
         )
+    }
+
+    /// Returns bounded samples of configured filter candidates without reading quota history.
+    fn scope_options(&self) -> Result<Value, &'static str> {
+        let settings = self.settings.lock().map_err(|_| "internal_error")?;
+        let sources = &settings.config.sources;
+        let accounts: BTreeSet<_> = sources
+            .iter()
+            .map(|source| source.account.as_str())
+            .collect();
+        let models: BTreeSet<_> = sources
+            .iter()
+            .flat_map(|source| source.models.iter().map(|model| model.id.as_str()))
+            .collect();
+        Ok(json!({
+            "accounts": accounts.iter().take(crate::ipc::SCOPE_SAMPLE_SIZE).collect::<Vec<_>>(),
+            "models": models.iter().take(crate::ipc::SCOPE_SAMPLE_SIZE).collect::<Vec<_>>(),
+            "more_accounts": accounts.len() > crate::ipc::SCOPE_SAMPLE_SIZE,
+            "more_models": models.len() > crate::ipc::SCOPE_SAMPLE_SIZE,
+        }))
     }
 
     /// Runs one sequential collection round and retains only bounded safe diagnostics.
@@ -1630,6 +1650,7 @@ pub(crate) async fn serve(
             move |request| {
                 let result = match request.method.as_str() {
                     "status" => api_engine.status(),
+                    "scope_options" => api_engine.scope_options(),
                     "snapshot" => api_engine.snapshot(&request.accounts, request.model.as_deref()),
                     "capacity" => api_engine.capacity(request.model.as_deref()),
                     "ingest" => request

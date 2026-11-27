@@ -9,12 +9,23 @@
 
 ### Changed
 
+- Report one changed-only quota outage line per previously updated hook session.
+- Show account and model narrowing filters and candidate identifiers for oversized reads.
+- Detect resident service version skew in MCP and doctor. MCP invalidates the tool
+  catalog once and asks the host to reconnect.
+
 - Rank provider capacity with usable banked resets and available Codex paid
   credits, while preserving the plan's status and window priority in the local API.
 - Show all model windows, UTC resets, rounded percentages, stale evidence and
   risk reasons in quota text. Show the paid Codex balance in `get_quota`.
 - Inject quota context on the first prompt and significant changes per host
   session. The `SessionStart` hook refreshes context after compact, clear or resume.
+
+### Security
+
+- Provide a resident Linux unit and tmpfiles rule with no privileged startup
+  command beneath a service-writable directory. See the installed-host migration
+  in the Linux owner collection guide.
 
 ## 0.3.0
 
