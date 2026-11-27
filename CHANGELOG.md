@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.4.0
+
 ### Added
 
 - Expose the optional Codex paid credit balance per account in socket snapshots
