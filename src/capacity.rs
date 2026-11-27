@@ -748,7 +748,7 @@ fn hook_label(value: &str) -> String {
 /// Renders shared counters once and names model-specific or differing counters.
 fn provider_line(provider: &HookProvider, at: f64) -> String {
     let mut windows: Vec<(&WindowView, BTreeSet<&str>)> = Vec::new();
-    let mut models = Vec::new();
+    let mut models: Vec<(Vec<String>, String)> = Vec::new();
     for model in &provider.models {
         for window in model.windows() {
             if let Some((_, names)) = windows.iter_mut().find(|(existing, _)| *existing == window) {
@@ -763,7 +763,7 @@ fn provider_line(provider: &HookProvider, at: f64) -> String {
             .map(display::window_label)
             .map(hook_label);
         let name = hook_label(&model.model);
-        let mut status = format!("{name} {}", model.status);
+        let mut status = format!(" {}", model.status);
         if let Some(reason) = display::reason(
             &model.status,
             limiting.as_deref(),
@@ -793,8 +793,22 @@ fn provider_line(provider: &HookProvider, at: f64) -> String {
         if !badges.is_empty() {
             status.push_str(&format!(" {}", badges.join(" ")));
         }
-        models.push(status);
+        // Models sharing an identical status line are listed once: `a/b limited: reason`.
+        if let Some((names, _)) = models.iter_mut().find(|(_, existing)| *existing == status) {
+            names.push(name);
+        } else {
+            models.push((vec![name], status));
+        }
     }
+    let total = provider.models.len();
+    let models = models.into_iter().map(|(names, status)| {
+        let who = if total > 1 && names.len() == total {
+            "all".to_owned()
+        } else {
+            names.join("/")
+        };
+        format!("{who}{status}")
+    });
     windows.sort_by_key(|(window, _)| (window.model_specific, window.window.as_str()));
     let next_reset = windows
         .iter()
@@ -807,7 +821,7 @@ fn provider_line(provider: &HookProvider, at: f64) -> String {
         let differing = windows.iter().any(|(other, _)| {
             other.window == window.window && !other.model_specific && *other != *window
         });
-        let label = if window.model_specific || differing {
+        let label = if (window.model_specific || differing) && names.len() < provider.models.len() {
             let names: Vec<_> = names.iter().map(|name| hook_label(name)).collect();
             format!("{} {label}", names.join("/"))
         } else {
@@ -1406,7 +1420,7 @@ mod tests {
     fn hook_text_is_compact_escaped_and_bounded() {
         let capacity = json!({"schema_version":1,"evaluated_at":0,"coverage":{"state":"complete","incomplete":false},
             "providers":[{"provider":"alpha","models":[{"model":"m\u{2028}1","status":"available"},{"model":"m2","status":"exhausted"}]},
-                         {"provider":"beta","models":[{"model":"m1","status":"unknown"},{"model":"long-model-name-that-does-not-fit","status":"unknown"}]}]});
+                         {"provider":"beta","models":[{"model":"m1","status":"unknown"},{"model":"long-model-name-that-does-not-fit","status":"exhausted"}]}]});
         let render =
             |value, limit| hook_block(value, limit).map_or_else(String::new, |block| block.text);
         let text = render(capacity.clone(), HOOK_DEFAULT_CHARS);
@@ -1419,7 +1433,7 @@ mod tests {
         );
         assert_eq!(
             lines[2],
-            "beta: m1 unknown · long-model-name-that-does-not-fit unknown"
+            "beta: m1 unknown · long-model-name-that-does-not-fit exhausted: plan window has no usable quota"
         );
         let budget = HOOK_HEADER.chars().count()
             + 1
